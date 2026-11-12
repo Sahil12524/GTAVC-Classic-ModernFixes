@@ -1,0 +1,19 @@
+# Build output (publish the DLL as a release asset instead)
+*.dll
+*.lib
+*.pdb
+*.obj
+*.o
+
+# Runtime files
+*.log
+
+# Local reverse-engineering scratch scripts (machine-specific paths, need local data files)
+tools/
+*.pkl
+
+# Editor / OS
+.vs/
+.vscode/
+Thumbs.db
+desktop.ini
