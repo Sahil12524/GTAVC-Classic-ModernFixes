@@ -3,4 +3,7 @@
 
 void PatchStreamingEarly();    // DllMain: before CStreaming::Init
 void InstallDrawDistance();    // first frame, with the other game hooks
-void DrawDistanceFrame();      // every frame (Present): follow the menu's Draw Distance
+void DrawDistanceFrame();       // every frame (Present): follow the menu's Draw Distance
+
+// Nodes in the see-through (alpha entity) list at 0xA0FD84: 200, or more once patched.
+const unsigned kMaxAlphaEntities = 1000;

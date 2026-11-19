@@ -29,16 +29,17 @@ static const DWORD GAME_STATE = 0x9B5F08, MENU_ACTIVE = 0x869668, GAME_WINDOW = 
 
 static DWORD g_play = FN_PLAY, g_finished = FN_FINISHED;
 static bool g_skipping = false, g_down = false, g_press = false;
+static bool g_forced = false;   // MissionAudioSkip: an intro scene is being skipped (missionhelp.cpp)
 static DWORD g_skipStart = 0;
 static unsigned g_skips = 0;
 
 static void __fastcall HookPlay(void* audio, void*, unsigned char slot) {
-    if (g_skipping) return;   // skipped line: not played
+    if (g_skipping || g_forced) return;   // skipped line: not played
     ((void (__thiscall*)(void*, unsigned char))g_play)(audio, slot);
 }
 
 static bool __fastcall HookFinished(void* audio, void*, unsigned char slot) {
-    if (g_skipping) return true;
+    if (g_skipping || g_forced) return true;
     return ((bool (__thiscall*)(void*, unsigned char))g_finished)(audio, slot);
 }
 
@@ -46,8 +47,10 @@ static bool InCall(unsigned char* ped) {
     return ped && *(int*)(ped + PED_STATE) == (int)PED_ANSWER_MOBILE;
 }
 
+static bool g_phoneOk = false;   // installed
+
 void PhoneSkipFrame() {
-    if (!g_cfg.phoneSkip) return;
+    if (!g_phoneOk || !g_cfg.phoneSkip) { g_press = false; return; }
     const bool down = (GetAsyncKeyState(g_cfg.phoneSkipKey) & 0x8000) != 0;
     const bool mod = ModifierDown();   // Alt+Enter and the like aren't a skip
     if (down && !g_down && !mod) g_press = true;
@@ -56,7 +59,10 @@ void PhoneSkipFrame() {
 }
 
 void PhoneSkipBeforeTick() {
-    if (!g_cfg.phoneSkip) return;
+    if (!g_phoneOk || !g_cfg.phoneSkip) {   // turned off in the Modern Fix menu: a skip under way ends
+        if (g_skipping) { g_skipping = false; ClearMessages(); }
+        return;
+    }
     const bool press = g_press;
     g_press = false;
     const bool playing = *(int*)GAME_STATE == 9 && !*(unsigned char*)MENU_ACTIVE;
@@ -100,13 +106,26 @@ static void Redirect(DWORD site, void* target) {
     FlushInstructionCache(GetCurrentProcess(), (void*)site, 5);
 }
 
+static bool g_audioHooks = false;
+
+bool MissionAudioSkip(bool on) {
+    if (!g_audioHooks) return false;
+    if (on && !g_forced) {
+        ClearMissionAudio(DMAudio, 0);
+        ClearMissionAudio(DMAudio, 1);
+    }
+    g_forced = on;
+    return true;
+}
+
+// The mission audio hooks also serve the intro skip (missionhelp.cpp), so they go in
+// when either feature is on; the Enter key itself only with PhoneSkip.
+// Installed even when both are off: the Modern Fix menu (fixmenu.cpp) turns them on and off.
 void InstallPhoneSkip() {
-    if (!g_cfg.phoneSkip) { Log("PhoneSkip: off"); return; }
     // CPed::SetAnswerMobile: push ebx; mov ebx,ecx; mov eax,[ebx+244h]; cmp eax,24h
     static const unsigned char answer[] = { 0x53, 0x89, 0xCB, 0x8B, 0x83, 0x44, 0x02, 0x00, 0x00, 0x83, 0xF8, 0x24 };
     const DWORD play = CallTarget(SITE_PLAY), finished = CallTarget(SITE_FINISHED);
     if (!play || !finished || memcmp((void*)0x4F59C0, answer, sizeof answer)) {
-        g_cfg.phoneSkip = false;
         Log("PhoneSkip: phone / mission audio code is not the v1.0 code; not installed");
         return;
     }
@@ -116,5 +135,7 @@ void InstallPhoneSkip() {
     g_finished = finished;
     Redirect(SITE_PLAY, (void*)&HookPlay);
     Redirect(SITE_FINISHED, (void*)&HookFinished);
-    Log("PhoneSkip: installed, key %d (virtual-key code)", g_cfg.phoneSkipKey);
+    g_audioHooks = true;
+    g_phoneOk = true;
+    Log("PhoneSkip: installed, key %d (virtual-key code) (%s)", g_cfg.phoneSkipKey, g_cfg.phoneSkip ? "on" : "off");
 }

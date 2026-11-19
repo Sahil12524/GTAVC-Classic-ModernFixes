@@ -5,3 +5,4 @@ void InstallGameplay();                           // first frame, with the other
 void GameplayBeforeTick();                        // start of a game update (fixedtick.cpp)
 void GameplayAfterPresent();                      // after Present (dllmain.cpp): used when FixedTick is off
 bool MouseAimVehicle(const unsigned char* veh);   // the vehicle aims with the camera (FreeCam keeps looking)
+void GameplaySettingsChanged();                   // the Modern Fix menu changed a setting (fixmenu.cpp)

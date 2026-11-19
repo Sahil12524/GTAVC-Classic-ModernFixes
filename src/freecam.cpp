@@ -23,9 +23,21 @@
 // (0x47C09F: Beta -= X * 2.5 * horizontal sensitivity * FOV/80, Alpha likewise
 // with 4.0 * Y). Off while the game uses the mouse to steer (Controls menu,
 // mouse steering) and while player controls are disabled (cutscenes).
+//
+// The vehicle is the one you control: a remote-controlled one if there is one
+// (CPlayerInfo +4, Players[0] at 0x94AD28, as GET_REMOTE_CONTROLLED_CAR reads it:
+// the RC helicopter, plane and cars of the RC missions), else the one you sit in.
+//
+// Boats ([Camera] FreeCamBoats): the game gives boats their own camera,
+// MODE_BEHINDBOAT (22, CCam::Process_BehindBoat 0x480F17), which none of the
+// above runs in. Where the camera picks a mode for the target vehicle (0x470C23:
+// vehicle type 1, a boat, requests 0x16 at 0x470C30), boats request mode 18 like
+// every other vehicle instead (the byte at 0x470C37), so they get the same string
+// camera, and with it the mouse look.
 #include "freecam.h"
 #include "config.h"
 #include "gameplay.h"
+#include "driveby.h"
 #include <windows.h>
 #include <math.h>
 #include <string.h>
@@ -40,7 +52,13 @@ static const DWORD MOUSE_X = 0x94D790, MOUSE_Y = 0x94D794;                // CPa
 static const DWORD SENS_H = 0x94DBD0, SENS_V = 0xA0D964;                  // CCamera mouse sensitivity
 static const DWORD PAD0 = 0x7DBCB0, PAD_DISABLE = 0xF0;                   // CPad::GetPad(0), DisablePlayerControls
 static const DWORD MOUSE_PLAYER_CAM = 0xA10B4C, NO_MOUSE_STEER = 0x69C610;
-static const DWORD FIND_PLAYER_VEHICLE = 0x4BC1E0;
+static const DWORD FIND_PLAYER_VEHICLE = 0x4BC1E0, REMOTE_VEHICLE = 0x94AD28 + 4;
+
+// The vehicle the player controls: the remote-controlled one, else the one they are in.
+static unsigned char* ControlledVehicle() {
+    if (unsigned char* rc = *(unsigned char**)REMOTE_VEHICLE) return rc;
+    return ((unsigned char*(__cdecl*)())FIND_PLAYER_VEHICLE)();
+}
 static const DWORD CLOCK = 0x974B2C, TIMESTEP = 0x975424;
 
 typedef void (__fastcall* String_t)(void*, void*, float*, float);
@@ -63,8 +81,30 @@ static struct {
     DWORD lastMouse, lastClock;
 } s;
 static unsigned g_starts = 0;
+// What the latest update turned the camera by from the mouse, as a view turn
+// (yaw left +, pitch up +), for the per-frame drawing (FreeCamFrameTurn).
+static float g_updYaw = 0.0f, g_updPitch = 0.0f;
+// Camera elevation above the target point, radians. Low limit: about 5 degrees
+// below it (the old 14 put the camera at ground level behind the vehicle, where the
+// game's collision pushed it back up: it bounced). The mouse's pitch is kept so
+// the elevation stays inside the limits, so turning back answers at once.
+static const float kElevMin = -0.09f, kElevMax = 1.25f;
+static float g_base = 0.0f;   // the game's own elevation at the latest update
 
 static const float PI = 3.14159265f;
+
+// [Camera] CarLookForwardKey (C): held in a vehicle, the camera is put straight
+// behind it, level with the game's own height, looking forward; the mouse is not
+// used meanwhile. Let go, the mouse look carries on from there (and, driving, the
+// game's camera takes over again after FreeCamReturnDelay as usual). By default C is
+// only the on-foot crouch (the game's defaults, 0x619D4A), so nothing in a vehicle
+// shares it. Not while the game's menu is open.
+static const DWORD MENU_ACTIVE = 0x869668;
+static unsigned g_fwdLogs = 0;
+static bool LookForwardHeld() {
+    const int k = g_cfg.carLookForwardKey;
+    return k > 0 && !*(volatile unsigned char*)MENU_ACTIVE && (GetAsyncKeyState(k) & 0x8000) != 0;
+}
 
 static float Heading(const unsigned char* veh, float fallback) {
     float fx = *(const float*)(veh + ENT_FORWARD), fy = *(const float*)(veh + ENT_FORWARD + 4);
@@ -123,9 +163,15 @@ void FreeCamAfterUpdate() {
 }
 
 static void __fastcall HookString(unsigned char* cam, void*, float* t, float baseDist) {
+    if (ReplayPlaying() || !g_cfg.freeCam) {   // the replay's camera, or turned off in the menu
+        s.cam = nullptr;
+        s.veh = nullptr;
+        g_origString(cam, nullptr, t, baseDist);
+        return;
+    }
     if (!g_fromRender) KeepFlyHeading();   // FixedTick off: one update late, still turns only the camera
     unsigned char* veh = *(unsigned char**)(cam + CAM_TARGET);
-    unsigned char* player = ((unsigned char*(__cdecl*)())FIND_PLAYER_VEHICLE)();
+    unsigned char* player = ControlledVehicle();
     if (!veh || veh != player) {
         s.cam = nullptr;
         s.veh = nullptr;   // next time in a vehicle: start fresh
@@ -154,12 +200,27 @@ static void __fastcall HookString(unsigned char* cam, void*, float* t, float bas
     const DWORD now = *(DWORD*)CLOCK;
     const bool newUpdate = now != s.lastClock;
     s.lastClock = now;
+    if (newUpdate) g_updYaw = g_updPitch = 0.0f;
 
     const bool mouseSteering = *(unsigned char*)MOUSE_PLAYER_CAM && !*(unsigned char*)NO_MOUSE_STEER;
     const bool blocked = mouseSteering || *(unsigned short*)(PAD0 + PAD_DISABLE);
     const float mx = *(float*)MOUSE_X, my = *(float*)MOUSE_Y;
     if (blocked) {
         s.active = false;
+    } else if (LookForwardHeld()) {   // straight behind the vehicle, looking forward
+        if (!s.active) {
+            float dx = src[0] - t[0], dy = src[1] - t[1];
+            s.horiz = sqrtf(dx * dx + dy * dy);
+            if (s.horiz < 0.01f) s.horiz = *(float*)(cam + 0xD0);
+            s.active = true;
+        }
+        float rel = live + PI - heading;
+        while (rel > PI) rel -= 2 * PI;
+        while (rel < -PI) rel += 2 * PI;
+        s.relYaw = rel;
+        s.pitch = 0.0f;
+        s.lastMouse = now;
+        if (g_fwdLogs++ == 0) Log("FreeCam: look forward key held: camera behind the vehicle, looking forward");
     } else if (newUpdate && (mx != 0.0f || my != 0.0f)) {   // once per game update
         if (!s.active) {
             float dx = src[0] - t[0], dy = src[1] - t[1];
@@ -170,17 +231,22 @@ static void __fastcall HookString(unsigned char* cam, void*, float* t, float bas
                                     s.horiz, *(float*)(cam + 0xD0));
         }
         const float scale = *(float*)(cam + CAM_FOV) / 80.0f * g_cfg.freeCamSensitivity / 100.0f;
-        s.relYaw -= mx * 2.5f * *(float*)SENS_H * scale;
+        const float turn = -mx * 2.5f * *(float*)SENS_H * scale;
+        s.relYaw += turn;
+        g_updYaw = turn;
+        const float pitchBefore = s.pitch;
         while (s.relYaw > PI) s.relYaw -= 2 * PI;
         while (s.relYaw < -PI) s.relYaw += 2 * PI;
         const float dp = my * 4.0f * *(float*)SENS_V * scale;
         s.pitch += g_cfg.freeCamInvertY ? dp : -dp;
         if (s.pitch > 1.2f) s.pitch = 1.2f;
         if (s.pitch < -0.6f) s.pitch = -0.6f;
+        g_updPitch = -(s.pitch - pitchBefore);   // camera raised = view tilted down
         s.lastMouse = now;
     }
-    // In the Rhino and fire truck the camera aims the gun: it stays where you put it.
-    if (s.active && g_cfg.freeCamReturnDelay >= 0 && Moving(veh) && !MouseAimVehicle(veh) &&
+    // In the Rhino and fire truck, and while shooting from the vehicle, the camera
+    // aims the gun: it stays where you put it.
+    if (s.active && g_cfg.freeCamReturnDelay >= 0 && Moving(veh) && !MouseAimVehicle(veh) && !DriveByAiming() &&
         now - s.lastMouse > (DWORD)g_cfg.freeCamReturnDelay)
         s.active = false;   // hand the camera back to the game: it swings behind the vehicle
 
@@ -210,17 +276,72 @@ static void __fastcall HookString(unsigned char* cam, void*, float* t, float bas
     }
 }
 
+// While the drive-by gun is out the camera's elevation is held: the game's height
+// step follows the vehicle's nose (bumps, braking, slopes) as seen from behind,
+// which tilts the camera up and down on its own when it looks from the side. The
+// elevation the game gave when the gun came out is kept; only the mouse changes it.
+static bool g_dbHeld = false;
+static float g_dbElev = 0.0f;
+
+// Per-frame drawing (interp.cpp): the turn the next update will make from the mouse
+// movement it hasn't seen yet (mx, my: counts as the game will read them), exactly
+// as HookString will apply it. Only while this camera is the one in use.
+bool FreeCamFrameTurn(float mx, float my, float* dYaw, float* dPitch, float* lastYaw, float* lastPitch,
+                      const unsigned char** veh) {
+    *dYaw = *dPitch = 0.0f;
+    if (!g_cfg.freeCam || ReplayPlaying() || !s.cam || !s.veh || s.veh != ControlledVehicle()) return false;
+    const unsigned char act = *(unsigned char*)0x7E46FE;
+    if (s.cam != (unsigned char*)(0x7E4810 + act * 0x1CC) || *(short*)(s.cam + 0x0C) != 18) return false;
+    const bool mouseSteering = *(unsigned char*)MOUSE_PLAYER_CAM && !*(unsigned char*)NO_MOUSE_STEER;
+    if (mouseSteering || *(unsigned short*)(PAD0 + PAD_DISABLE)) return false;
+    if (LookForwardHeld()) return false;   // the mouse doesn't turn it: drawn blended
+    // the game's mouse state is flipped by the menu's invert options (0x4AD88E)
+    if (*(unsigned char*)0xA10A4C) mx = -mx;
+    if (*(unsigned char*)0xA10A4D) my = -my;
+    const float scale = *(float*)(s.cam + CAM_FOV) / 80.0f * g_cfg.freeCamSensitivity / 100.0f;
+    *dYaw = -mx * 2.5f * *(float*)SENS_H * scale;
+    const float dp = my * 4.0f * *(float*)SENS_V * scale;
+    float p = s.pitch + (g_cfg.freeCamInvertY ? dp : -dp);
+    if (p > 1.2f) p = 1.2f;
+    if (p < -0.6f) p = -0.6f;
+    if (g_base + p > kElevMax) p = kElevMax - g_base;   // as HookHeight will keep it
+    if (g_base + p < kElevMin) p = kElevMin - g_base;
+    *dPitch = -(p - s.pitch);
+    *lastYaw = g_updYaw;
+    *lastPitch = g_updPitch;
+    *veh = s.veh;
+    return true;
+}
+
 static void __fastcall HookHeight(unsigned char* cam, void*, float* t, float orientation, float height) {
     g_origHeight(cam, nullptr, t, orientation, height);
-    if (cam != s.cam || s.pitch == 0.0f) return;
+    const bool hold = cam == s.cam && DriveByAiming() && !ReplayPlaying();
+    if (!hold) g_dbHeld = false;
+    if (cam != s.cam || ReplayPlaying()) return;
     float* src = (float*)(cam + CAM_SOURCE);
     float dx = src[0] - t[0], dy = src[1] - t[1], dz = src[2] - t[2];
     float h = sqrtf(dx * dx + dy * dy);
     if (h < 0.01f) return;
     float dist = sqrtf(h * h + dz * dz);
-    float e = atan2f(dz, h) + s.pitch;
-    if (e > 1.25f) e = 1.25f;    // about 72 degrees above
-    if (e < -0.25f) e = -0.25f;  // about 14 degrees below
+    float base = atan2f(dz, h);
+    if (hold) {
+        if (!g_dbHeld) { g_dbHeld = true; g_dbElev = base; }
+        base = g_dbElev;
+    }
+    g_base = base;
+    if (s.pitch == 0.0f && !hold) return;   // the game's own height
+    if (!hold) {   // keep the mouse's part inside the limits
+        float p = s.pitch;
+        if (base + p > kElevMax) p = kElevMax - base;
+        if (base + p < kElevMin) p = kElevMin - base;
+        if (p != s.pitch) {
+            if (g_updPitch != 0.0f) g_updPitch -= p - s.pitch;   // the mouse's turn this update, as kept (view up +)
+            s.pitch = p;
+        }
+    }
+    float e = base + s.pitch;
+    if (e > kElevMax) e = kElevMax;   // about 72 degrees above
+    if (e < kElevMin) e = kElevMin;   // about 5 degrees below
     float nh = dist * cosf(e) / h;
     src[0] = t[0] + dx * nh;
     src[1] = t[1] + dy * nh;
@@ -228,7 +349,7 @@ static void __fastcall HookHeight(unsigned char* cam, void*, float* t, float ori
 }
 
 static void __fastcall HookRot(unsigned char* cam, void*, float* t, float orientation) {
-    if (cam == s.cam && s.active) return;   // looking around: don't swing back behind the vehicle
+    if (cam == s.cam && s.active && !ReplayPlaying()) return;   // looking around: don't swing back behind the vehicle
     g_origRot(cam, nullptr, t, orientation);
 }
 
@@ -247,8 +368,22 @@ static void Redirect(DWORD site, void* target) {
     FlushInstructionCache(GetCurrentProcess(), (void*)site, 5);
 }
 
+// Boats on the vehicle camera: the camera mode byte at 0x470C37 (game: 16h, boat camera).
+static bool g_boatOk = false;
+void FreeCamBoatsApply() {
+    if (!g_boatOk) return;
+    const unsigned char mode = g_cfg.freeCam && g_cfg.freeCamBoats ? 0x12 : 0x16;   // MODE_CAM_ON_A_STRING / boat
+    if (*(unsigned char*)0x470C37 == mode) return;
+    DWORD old;
+    VirtualProtect((void*)0x470C37, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(unsigned char*)0x470C37 = mode;
+    VirtualProtect((void*)0x470C37, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)0x470C37, 1);
+}
+
+// Installed even when off: the Modern Fix menu (fixmenu.cpp) turns it on and off while
+// playing; the hooks then pass straight to the game's camera.
 void InstallFreeCam() {
-    if (!g_cfg.freeCam) { Log("FreeCam: off"); return; }
     if (CallTarget(SITE_STRING) != FN_STRING || CallTarget(SITE_HEIGHT) != FN_HEIGHT || CallTarget(SITE_ROT) != FN_ROT) {
         Log("FreeCam: vehicle camera code changed by another mod (%06lX %06lX %06lX); not installed",
             CallTarget(SITE_STRING), CallTarget(SITE_HEIGHT), CallTarget(SITE_ROT));
@@ -260,6 +395,19 @@ void InstallFreeCam() {
     Redirect(SITE_STRING, (void*)&HookString);
     Redirect(SITE_HEIGHT, (void*)&HookHeight);
     Redirect(SITE_ROT, (void*)&HookRot);
-    Log("FreeCam: installed (sensitivity %d%%, return delay %d ms, invert Y %d)", g_cfg.freeCamSensitivity,
+    {
+        // cmp dword [esp+38h],1; jne ...; fstp st0; mov word [ReqMode 0x70388A], 16h
+        static const unsigned char boat[] = { 0x83, 0x7C, 0x24, 0x38, 0x01, 0x0F, 0x85, 0x37, 0x2D, 0x00, 0x00, 0xDD, 0xD8,
+                                              0x66, 0xC7, 0x05, 0x8A, 0x38, 0x70, 0x00, 0x16, 0x00 };
+        if (!memcmp((void*)0x470C23, boat, sizeof boat)) {
+            g_boatOk = true;
+            FreeCamBoatsApply();
+            Log("FreeCam: boats %s", g_cfg.freeCam && g_cfg.freeCamBoats ? "use the vehicle camera (mouse look on boats)"
+                                                                          : "keep their own camera");
+        } else {
+            Log("FreeCam: boat camera code is not v1.0; boats keep their own camera");
+        }
+    }
+    Log("FreeCam: installed, %s (sensitivity %d%%, return delay %d ms, invert Y %d)", g_cfg.freeCam ? "on" : "off", g_cfg.freeCamSensitivity,
         g_cfg.freeCamReturnDelay, g_cfg.freeCamInvertY);
 }

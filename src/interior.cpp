@@ -12,14 +12,21 @@
 //    with a jetpack - left the wrong area set. Once per game update this looks at
 //    what the player stands on: a vertical line down from the player
 //    (CWorld::ProcessVerticalLine 0x4D8B00, buildings only). Its area:
-//    * an interior other than the current one: the player is in that room. Coming
-//      from the city, a ceiling above the player is also required
-//      (CWorld::GetIsLineOfSightClear 0x4DA560), so a sidewalk never counts.
-//    * the city while an interior is set: the player has left the room - once
-//      outside every building of that interior (their collision bounding
-//      spheres), or, for a room this file switched to, with open sky above.
-//    * nothing (in the air) while an interior is set: once the interior's nearest
-//      building is 30 m or more away.
+//    The line has no area test (0x4D84D0 only checks "uses collision"), so it hits
+//    the city, every interior and hidden pieces alike. Its area:
+//    * an interior other than the current one: the player is in that room, if
+//      within 2 m of one of its pieces' collision boxes (not from above its roof).
+//      Coming from the city, a ceiling above the player is also required
+//      (CWorld::GetIsLineOfSightClear 0x4DA560), so a sidewalk never counts. Its
+//      stand-in for the street (htl_exterior03) is never its floor.
+//    * the city, or ground shown in every area (13: Ocean Drive's road and the
+//      whole beach east of the Ocean View, oceanrda04-06, miamiland_kb02-04,
+//      odhighsandgrs1), while an interior is set: the player has left the room
+//      once more than 1.5 m outside every collision box of its pieces.
+//    * the current interior's own piece: the player is above its roof once more
+//      than 4 m from every piece (the mall's roof, the stadium's stands count).
+//    * nothing (in the air) while an interior is set: more than 3 m from every
+//      piece. RoomDist says which pieces count.
 //    The new area must hold for half a second with the player in control. Then it
 //    is applied like the script does it (area, RemoveBuildingsNotInArea, LoadScene
 //    with CTimer::Stop / Update around it). Going back to the city also undoes what
@@ -44,7 +51,9 @@
 //    player and the room within 80 m when the area is set.
 #include "interior.h"
 #include "config.h"
+#include "timing.h"
 #include <windows.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -72,6 +81,7 @@ static const auto StopExtraColour = (void (__cdecl*)(bool))0x4CE9E0;
 static const auto OnMission = (bool (__cdecl*)())0x44FE30;
 
 static bool g_fromIdle = false;
+static unsigned long long g_sceneCycles = 0;   // LoadScene's share of this InteriorEndOfTick (Timing)
 static int g_pending = -1;          // area the player seems to be in, waiting to hold
 static DWORD g_pendingSince = 0;
 static int g_forced = -1;           // interior this file switched to (no door script ran)
@@ -119,6 +129,7 @@ static DWORD g_waterFn = WATER_AREA_FN, g_removeFn = REMOVE_NOT_IN_AREA;
 static bool g_viewOk = false;       // ShowOutside installed
 static int g_viewArea = 0;          // area the outside view was decided for
 static bool g_viewDecided = true;
+static int g_nRoomFirst = 0, g_roomFirstArea = -1;   // room walls drawn first (HookInsertSorted), for the log
 
 // ---------------------------------------------------------------- entities
 template <class F> static void ForEachBuilding(F f) {
@@ -133,6 +144,32 @@ template <class F> static void ForEachBuilding(F f) {
         for (int i = 0; i < size; i++)
             if (!(flags[i] & 0x80)) f(objs + i * ENTITY_SIZE);
     }
+}
+
+// A pointer kept in a list (hidden buildings, opened doorways) is written through only
+// when it is still a building: inside the building or treadable pool's object array as
+// the pools are now, on a slot boundary, with that slot in use. (Crash in Unhide,
+// d3d8.dll+0x1330E: the first hidden pointer was into memory that was no longer a
+// building, vtable 0, and the read of its area faulted.)
+static bool LiveBuilding(const unsigned char* e) {
+    const DWORD pools[2] = { BUILDING_POOL, SECOND_POOL };
+    for (DWORD pool : pools) {
+        const unsigned char* pl = *(const unsigned char* const*)pool;
+        if (!pl) continue;
+        const unsigned char* objs = *(const unsigned char* const*)pl;
+        const unsigned char* flags = *(const unsigned char* const*)(pl + 4);
+        const int size = *(const int*)(pl + 8);
+        if (!objs || !flags || size <= 0 || e < objs) continue;
+        const DWORD off = (DWORD)(e - objs);
+        if (off >= (DWORD)size * ENTITY_SIZE) continue;
+        return off % ENTITY_SIZE == 0 && !(flags[off / ENTITY_SIZE] & 0x80);
+    }
+    return false;
+}
+
+static unsigned g_staleLogs = 0;
+static void DroppedStale(int n, const char* list) {
+    if (n && g_staleLogs++ < 50) Log("Interiors: dropped %d stale hidden pointers (%s); nothing written through them", n, list);
 }
 
 static const float* ColModel(unsigned char* e) {
@@ -156,6 +193,30 @@ static float Dist(const float* a, const float* b) {
 
 static int RealArea(unsigned char* e);
 
+// The buildings of each area other than the city, in the order ForEachBuilding visits
+// them (below, after RealArea). Buildings never move and their area only changes here
+// (HideOne / Unhide, which RealArea sees through), so the lists hold while the two
+// building pools' slot flags are unchanged.
+static int AreaList(int area, unsigned char* const** out);   // real area `area` (1..255); -1: no lists
+static int NonCityList(unsigned char* const** out);          // real area other than 0; -1: no lists
+// Runs f on the buildings of `area` in pool order: from its list, or the whole pools
+// for the city (or if the lists couldn't be built). Every caller still tests the area
+// itself, so a list only has to hold at least the buildings that pass that test, in
+// pool order, for the result to be the one a walk over the whole pools gives
+// (VerifyLists checks that it holds exactly them).
+template <class F> static void ForEachOfArea(int area, F f) {
+    unsigned char* const* list;
+    const int n = area > 0 && area <= 255 ? AreaList(area, &list) : -1;
+    if (n < 0) { ForEachBuilding(f); return; }
+    for (int i = 0; i < n; i++) f(list[i]);
+}
+template <class F> static void ForEachNonCity(F f) {
+    unsigned char* const* list;
+    const int n = NonCityList(&list);
+    if (n < 0) { ForEachBuilding(f); return; }
+    for (int i = 0; i < n; i++) f(list[i]);
+}
+
 // Distance from p to the nearest building of `area` (to its collision bounding
 // sphere; negative inside it). Hidden buildings count for their own area. 1e9 if none.
 static void WorldBox(const float* m, const float* mn, const float* mx, float* lo, float* hi);
@@ -166,9 +227,10 @@ static bool IslandCopy(unsigned char* e, const float* col);
 // long around the whole mall, has a sphere reaching far into the streets around
 // it, so the player would never count as out of the mall there. Pieces hidden as
 // stand-ins for the outside (island copies, that black box) don't count.
-static float NearestOfArea(int area, const float* p) {
+// `each` walks the buildings: the area's list, or the whole pools.
+template <class Each> static float NearestOfAreaIn(Each each, int area, const float* p) {
     float best = 1e9f;
-    ForEachBuilding([&](unsigned char* e) {
+    each([&](unsigned char* e) {
         if (e[ENT_AREA] != area && !(e[ENT_AREA] == AREA_HIDDEN && RealArea(e) == area)) return;
         const float* col = ColModel(e);
         if (!col || (area != 0 && IslandCopy(e, col))) return;
@@ -187,6 +249,16 @@ static float NearestOfArea(int area, const float* p) {
     return best;
 }
 
+static unsigned g_listDiffLogs = 0;
+static void ListDiffer(const char* what, int area) {
+    if (g_listDiffLogs++ < 10) Log("Interiors: %s for area %d differed from the walk over the whole pools; the lists are built again", what, area);
+}
+
+static float NearestOfArea(int area, const float* p) {
+    if (area == 0) return NearestOfAreaIn([](auto f) { ForEachBuilding(f); }, 0, p);   // the city: most of the pools anyway
+    return NearestOfAreaIn([area](auto f) { ForEachOfArea(area, f); }, area, p);
+}
+
 // ---------------------------------------------------------------- outside view
 static unsigned char* g_hidden[8192];
 static unsigned char g_hiddenArea[8192];   // the area each one had
@@ -196,9 +268,14 @@ struct Piece { float m[16]; float mn[3], mx[3], c[3], r; float lo[3], hi[3]; };
 static Piece g_pieces[1024];
 
 static void Unhide() {
-    for (int i = 0; i < g_nHidden; i++)
-        if (g_hidden[i][ENT_AREA] == AREA_HIDDEN) g_hidden[i][ENT_AREA] = g_hiddenArea[i];
+    int stale = 0;
+    for (int i = 0; i < g_nHidden; i++) {
+        unsigned char* e = g_hidden[i];
+        if (!LiveBuilding(e)) { stale++; continue; }
+        if (e[ENT_AREA] == AREA_HIDDEN) e[ENT_AREA] = g_hiddenArea[i];
+    }
     g_nHidden = 0;
+    DroppedStale(stale, "hidden buildings");
 }
 
 static int RealArea(unsigned char* e) {
@@ -206,6 +283,120 @@ static int RealArea(unsigned char* e) {
     for (int i = 0; i < g_nHidden; i++)
         if (g_hidden[i] == e) return g_hiddenArea[i];
     return 0;
+}
+
+// ---------------------------------------------------------------- buildings by area
+// NearestOfArea, RoomDist, CollectPieces and InteriorNear walked both building pools
+// (7000 + 1250 slots, one entity cache line each) on every call: RoomDist once or
+// twice an update while an interior is set, InteriorNear 4 times a second in the
+// city. They only ever want an interior's buildings, a few hundred in all. Those are
+// listed once, by RealArea, in pool order (building pool, then treadables, by slot),
+// so a walk over a list visits exactly the buildings the whole-pool walk would pass,
+// in the same order: same distances, same nearest piece, same pieces hidden.
+// The lists are built again when either pool's object array, size or slot flags (in
+// use, and the id that changes when a slot is reused) differ from the snapshot taken
+// with them (a memcmp of 8250 bytes); a building's area changes only through HideOne
+// / Unhide, which RealArea sees through. Every 5 s a list is also compared with a walk
+// over the whole pools (VerifyLists).
+static const int kMaxListed = 16384;
+static unsigned char* g_nonCity[kMaxListed];      // real area other than 0, pool order
+static unsigned char g_nonCityArea[kMaxListed];
+static int g_nNonCity = 0;
+static unsigned char* g_byArea[kMaxListed];       // the same, grouped by area, pool order inside each
+static int g_areaFirst[256], g_areaCount[256];
+static bool g_listsBuilt = false;
+static const unsigned char* g_listObjs[2];
+static const unsigned char* g_listFlagsPtr[2];
+static int g_listSize[2];
+static unsigned char g_listFlags[2][kMaxListed / 2];
+static unsigned g_listBuilds = 0;
+
+
+static bool PoolsAsListed() {
+    const DWORD pools[2] = { BUILDING_POOL, SECOND_POOL };
+    for (int k = 0; k < 2; k++) {
+        const unsigned char* pl = *(const unsigned char* const*)pools[k];
+        const unsigned char* objs = pl ? *(const unsigned char* const*)pl : nullptr;
+        const unsigned char* flags = pl ? *(const unsigned char* const*)(pl + 4) : nullptr;
+        const int size = pl ? *(const int*)(pl + 8) : 0;
+        if (objs != g_listObjs[k] || flags != g_listFlagsPtr[k] || size != g_listSize[k]) return false;
+        if (objs && flags && size > 0 && memcmp(g_listFlags[k], flags, size)) return false;
+    }
+    return true;
+}
+
+// Fills `out` / `areas` with the non-city buildings by walking the whole pools.
+static int WalkNonCity(unsigned char** out, unsigned char* areas) {
+    int n = 0;
+    ForEachBuilding([&](unsigned char* e) {
+        const int a = RealArea(e);
+        if (a == 0 || n >= kMaxListed) return;
+        out[n] = e;
+        areas[n++] = (unsigned char)a;
+    });
+    return n;
+}
+
+static void BuildLists() {
+    const DWORD pools[2] = { BUILDING_POOL, SECOND_POOL };
+    for (int k = 0; k < 2; k++) {
+        const unsigned char* pl = *(const unsigned char* const*)pools[k];
+        g_listObjs[k] = pl ? *(const unsigned char* const*)pl : nullptr;
+        g_listFlagsPtr[k] = pl ? *(const unsigned char* const*)(pl + 4) : nullptr;
+        g_listSize[k] = pl ? *(const int*)(pl + 8) : 0;
+        if (g_listSize[k] > kMaxListed / 2 || g_listSize[k] < 0) { g_listsBuilt = false; return; }   // not the game's pools
+        if (g_listObjs[k] && g_listFlagsPtr[k] && g_listSize[k] > 0) memcpy(g_listFlags[k], g_listFlagsPtr[k], g_listSize[k]);
+    }
+    g_nNonCity = WalkNonCity(g_nonCity, g_nonCityArea);
+    memset(g_areaCount, 0, sizeof g_areaCount);
+    for (int i = 0; i < g_nNonCity; i++) g_areaCount[g_nonCityArea[i]]++;
+    for (int a = 0, at = 0; a < 256; a++) { g_areaFirst[a] = at; at += g_areaCount[a]; }
+    int fill[256];
+    memcpy(fill, g_areaFirst, sizeof fill);
+    for (int i = 0; i < g_nNonCity; i++) g_byArea[fill[g_nonCityArea[i]]++] = g_nonCity[i];
+    g_listsBuilt = true;
+    if (g_listBuilds++ < 10) Log("Interiors: %d buildings of interiors listed by area (of the building pools' %d + %d slots)",
+                                 g_nNonCity, g_listSize[0], g_listSize[1]);
+}
+
+// Every 5 s: the list against a walk over the whole pools. A difference (a building's
+// area changed by something other than HideOne / Unhide) is logged and the lists are
+// built again from the walk, so they never stay different for longer than that.
+static TimingCheck g_checkLists = { "Interiors building lists (compared with a walk over the whole pools every 5 s)" };
+static void VerifyLists() {
+    static DWORD last = 0;
+    const DWORD now = GetTickCount();
+    if (g_listsBuilt && now - last < 5000) return;
+    last = now;
+    if (!g_listsBuilt) return;
+    static unsigned char* walk[kMaxListed];
+    static unsigned char areas[kMaxListed];
+    const unsigned long long t0 = TimingStart();
+    const int n = WalkNonCity(walk, areas);
+    const unsigned long long t1 = TimingStart();
+    const bool same = n == g_nNonCity && !memcmp(walk, g_nonCity, n * sizeof *walk) && !memcmp(areas, g_nonCityArea, n);
+    TimingCheckAdd(g_checkLists, t1 - t0, 0, same);
+    if (!same) { ListDiffer("the building lists", -1); g_listsBuilt = false; }
+}
+
+static void ListsReady() {
+    if (!g_listsBuilt || !PoolsAsListed()) BuildLists();
+    else VerifyLists();
+    if (!g_listsBuilt) BuildLists();
+}
+
+static int AreaList(int area, unsigned char* const** out) {
+    ListsReady();
+    *out = nullptr;
+    if (!g_listsBuilt) return -1;
+    *out = g_byArea + g_areaFirst[area];
+    return g_areaCount[area];
+}
+
+static int NonCityList(unsigned char* const** out) {
+    ListsReady();
+    *out = g_nonCity;
+    return g_listsBuilt ? g_nNonCity : -1;
 }
 
 static void HideOne(unsigned char* e) {
@@ -229,8 +420,11 @@ static bool IsStandIn(const char* name) {
     int i = 0;
     for (; i < 24 && name[i]; i++) n[i] = (char)(name[i] >= 'A' && name[i] <= 'Z' ? name[i] + 32 : name[i]);
     n[i] = 0;
+    // man_backside_int (area 2): the mansion's own copy of its back garden and terrace
+    // (131 x 46 m) for the view from its windows, with the lawn 0.7 m above the real
+    // one (man_grnd2); drawn with the city it floated over the lawn at knee height.
     return strstr(n, "exterior") || strstr(n, "fake_ext") || strstr(n, "blackpoly") ||
-           (i >= 4 && !strcmp(n + i - 4, "_ext"));
+           (i >= 4 && !strcmp(n + i - 4, "_ext")) || !strcmp(n, "man_backside_int");
 }
 
 // World-space box around an entity's collision box.
@@ -312,7 +506,9 @@ static int CollectPieces(int area, const float* p, int& standIns, char* standInN
     int n = 0;
     standIns = 0;
     standInNames[0] = 0;
-    ForEachBuilding([&](unsigned char* e) {
+    // area is an interior (1..18): its list holds every building whose area byte is
+    // `area`, in pool order (HideOne below changes only area bytes, not the pools)
+    ForEachOfArea(area, [&](unsigned char* e) {
         if (e[ENT_AREA] != area || n >= 1024) return;
         const float* col = ColModel(e);
         float c[3];
@@ -500,13 +696,21 @@ static void HideContaining(const float* p) {
 // deleted (walking away, area changes). So a part is put back only when it can be
 // checked: the building has its drawn copy again, with the same geometry, and the
 // same mesh still holds exactly what was written. Until then it stays on the list.
-struct Punched { unsigned char* ent; unsigned char* geo; unsigned char* header; unsigned short* idx; int count; int saved; int mesh; };
+// Each record also keeps the building's model id: the pointers are into that
+// model's geometry, which the streaming frees when it drops the model (and a later
+// load may put new data at the same addresses). A record whose model is no longer
+// loaded (CStreaming::ms_aInfoForModel 0x94DDD8, 20 bytes a model, +0 load state, 1
+// = loaded) has nothing left to put back and is dropped without touching it.
+struct Punched { unsigned char* ent; unsigned char* geo; unsigned char* header; unsigned short* idx; int count; int saved; int mesh; int model; };
+static bool ModelLoaded(int model) {
+    return model >= 0 && model < 6500 && *((const unsigned char*)0x94DDD8 + model * 20) == 1;
+}
 static Punched g_punched[64];
 static int g_nPunched = 0;
 static unsigned short g_savedIdx[32768];
 static int g_savedUsed = 0;
 static int g_lookArea = -1, g_lookPieces = 0;
-static unsigned g_lookLogs = 0;
+static unsigned g_lookLogs = 0, g_reopens = 0;
 
 static unsigned char* AtomicGeometry(unsigned char* e) {
     unsigned char* obj = *(unsigned char**)(e + 0x4C);   // CEntity::m_rwObject
@@ -546,7 +750,11 @@ static void Punch(unsigned char* e) {
         unsigned char* material = *(unsigned char**)(mesh + 8);
         if (!idx || count < 3 || count > 4096 || !material || !BlackTexture(material)) continue;
         bool done = false;
-        for (int j = 0; j < g_nPunched && !done; j++) done = g_punched[j].idx == idx;
+        int again = -1;   // this building's mesh was opened before and its model loaded again since
+        for (int j = 0; j < g_nPunched && !done; j++) {
+            done = g_punched[j].idx == idx;
+            if (!done && g_punched[j].ent == e && g_punched[j].mesh == i) again = j;
+        }
         if (done) continue;
         bool degenerate = true;   // already all one vertex: nothing to open (or to save)
         for (int k = 1; k < count && degenerate; k++) degenerate = idx[k] == idx[0];
@@ -570,15 +778,26 @@ static void Punch(unsigned char* e) {
             inRoom = c[0] >= pc.lo[0] - 1.5f && c[0] <= pc.hi[0] + 1.5f && c[1] >= pc.lo[1] - 1.5f &&
                      c[1] <= pc.hi[1] + 1.5f && c[2] >= pc.lo[2] - 1.5f && c[2] <= pc.hi[2] + 1.5f;
         }
-        if (!inRoom || g_nPunched >= 64 || g_savedUsed + count > 32768) continue;
-        Punched& pu = g_punched[g_nPunched++];
-        pu = { e, geo, header, idx, count, g_savedUsed, i };
-        memcpy(g_savedIdx + g_savedUsed, idx, count * sizeof *idx);
-        g_savedUsed += count;
+        if (!inRoom) continue;
+        // A model loaded again (streamed out and back in) comes back with its black
+        // part closed: it is opened again, in the same record (the old one points at
+        // freed data), and only counted in the log.
+        int saved = g_savedUsed;
+        if (again >= 0 && count <= g_punched[again].count) saved = g_punched[again].saved;
+        else if (g_savedUsed + count > 32768) continue;
+        if (again < 0 && g_nPunched >= 64) continue;
+        Punched& pu = g_punched[again >= 0 ? again : g_nPunched++];
+        pu = { e, geo, header, idx, count, saved, i, *(short*)(e + ENT_MODEL) };
+        memcpy(g_savedIdx + saved, idx, count * sizeof *idx);
+        if (saved == g_savedUsed) g_savedUsed += count;
         for (int k = 1; k < count; k++) idx[k] = idx[0];
         changed = true;
-        if (g_lookLogs < 50)
+        if (again >= 0) {
+            if (g_reopens++ % 100 == 0)
+                Log("Interiors:   %s was loaded again; its doorway opened again (%u times so far)", ModelName(e), g_reopens);
+        } else if (g_lookLogs < 50) {
             Log("Interiors:   opened the doorway of %s (black part at %.1f %.1f %.1f)", ModelName(e), c[0], c[1], c[2]), g_lookLogs++;
+        }
     }
     if (changed) (*(unsigned short*)(header + 6))++;   // RenderWare rebuilds the model's buffers
 }
@@ -595,9 +814,12 @@ static bool StillPunched(const Punched& pu, unsigned char* geo) {
 }
 
 static void Unpunch() {
-    int keep = 0;
+    int keep = 0, stale = 0;
     for (int i = 0; i < g_nPunched; i++) {
         const Punched& pu = g_punched[i];
+        if (!LiveBuilding(pu.ent)) { stale++; continue; }   // its building is gone: nothing safe to check through it
+        // the model was dropped (its geometry freed) or the building now shows another
+        if (!ModelLoaded(pu.model) || *(short*)(pu.ent + ENT_MODEL) != pu.model) continue;
         unsigned char* geo = AtomicGeometry(pu.ent);
         if (!geo) { g_punched[keep++] = pu; continue; }   // not drawn right now: check again later
         if (StillPunched(pu, geo)) {
@@ -608,6 +830,7 @@ static void Unpunch() {
     }
     g_nPunched = keep;
     if (!keep) g_savedUsed = 0;
+    DroppedStale(stale, "opened doorways");
 }
 
 static void PunchNear(const float* p) {
@@ -712,14 +935,21 @@ static void LookEnd() {
     g_lookArea = -1;
 }
 
+// Interiors not built inside their own city building but laid over the city: area 10,
+// the Ammu-Nation shooting range (hogans_alley_b, hogans_alley), covers the downtown
+// street and crossing in front of the shop (x -697..-645, y 1164..1299) with its own
+// plain floor at street level. Drawn with the city (from the street, or the city
+// from inside it), that floor covered the road: neither is done for these.
+static bool OverCity(int area) { return area == 10; }
+
 // The interior with a building inside a city building within 20 m of p (its
 // stand-in exterior pieces don't count), or -1.
-static int InteriorNear(const float* p) {
+template <class Each> static int InteriorNearIn(Each each, const float* p) {
     int best = -1;
     float bestD = 20.0f;
-    ForEachBuilding([&](unsigned char* e) {
+    each([&](unsigned char* e) {
         const int a = RealArea(e);
-        if (a == 0 || a == AREA_EVERYWHERE || a > 18) return;
+        if (a == 0 || a == AREA_EVERYWHERE || a > 18 || OverCity(a)) return;
         const float* col = ColModel(e);
         if (!col || IslandCopy(e, col) || IsStandIn(ModelName(e))) return;
         // Distance from p to the piece's collision box (0 inside it).
@@ -733,6 +963,12 @@ static int InteriorNear(const float* p) {
         if (d < bestD && Enclosed(e)) { bestD = d; best = a; }
     });
     return best;
+}
+
+// The interiors' buildings only (real area 1..18 is a subset of the non-city list, in
+// pool order).
+static int InteriorNear(const float* p) {
+    return InteriorNearIn([](auto f) { ForEachNonCity(f); }, p);
 }
 
 static void UpdateLook(const float* p) {
@@ -770,7 +1006,9 @@ static bool DecideView(int area, const float* p) {
     vcmf_also = -1;
     g_viewArea = area;
     g_viewDecided = p != nullptr;
-    if (!g_viewOk || !p || area == 0 || area == AREA_EVERYWHERE || !InCity(area, p)) return false;
+    g_roomFirstArea = -1;   // the room order is logged again for this visit
+    g_nRoomFirst = 0;
+    if (!g_viewOk || !g_cfg.interiorView || !p || area == 0 || area == AREA_EVERYWHERE || OverCity(area) || !InCity(area, p)) return false;
     if (g_viewLogs < 50) Log("Interiors: area %d shows the city around it (player at %.0f %.0f %.0f)", area, p[0], p[1], p[2]);
     Hide(area, p);
     HideContaining(p);
@@ -793,8 +1031,26 @@ static bool __cdecl HookWater() {
     return vcmf_outside || ((bool (__cdecl*)())g_waterFn)();
 }
 
+// ShowOutside turned off in the Modern Fix menu: everything shown with the area goes
+// back as the game has it (the city from inside, or a room from the street).
+static void ViewOff() {
+    LookEnd();
+    Unpunch();
+    g_lookPieces = 0;
+    g_nShells = 0;
+    Unhide();
+    vcmf_outside = false;
+    vcmf_also = -1;
+}
+
 static void UpdateView() {
     if (!g_viewOk) return;
+    static bool wasOn = true;
+    if (!g_cfg.interiorView) {
+        if (wasOn) { wasOn = false; ViewOff(); Log("Interiors: outside view turned off"); }
+        return;
+    }
+    if (!wasOn) { wasOn = true; g_viewDecided = false; }   // turned on: decide for the area now
     const int cur = *CurrArea;
     if (cur != g_viewArea || !g_viewDecided) { DecideView(cur, PlayerPos()); return; }
     const float* p = PlayerPos();
@@ -869,50 +1125,247 @@ static void __cdecl HookRenderOne(unsigned char* e) {
     }
 }
 
+// ---------------------------------------------------------------- room walls before what stands in the room
+// Pieces whose model is drawn last (IDE flag 4) go into CVisibilityPlugins' alpha
+// list (0xA0FD84) through InsertEntityIntoSortedList (0x581440, cdecl (entity,
+// distance)), which keeps it sorted by the distance from the camera
+// (CRenderer::ms_vecCameraPosition, 0x975398) to the entity's position; the list is
+// drawn far to near after everything solid. Some rooms are built with their walls
+// in such a piece: the Ocean View lobby's ht_mainfloor_dy (IDE flags 164, collision
+// box 21 x 26 x 5 m around the whole lobby) holds the lobby's walls, and its plants
+// are pieces of the same kind (ht_veg04_dy yuccas, ht_veg01_dy trees, ht_veg02_dy
+// planters, flags 36), whose positions are a few metres from the lobby's. From
+// behind the player at the reception counter ht_veg04_dy's position is further
+// than ht_mainfloor_dy's, so the yuccas were drawn before the walls: their leaf
+// cards (DXT3, most texels between clear and solid) write depth, the wall behind
+// them then fails the depth test, and what was drawn before shows through - the
+// street, drawn with the solid world while the city is shown (ShowOutside).
+// While the player is in an interior, a piece of that interior whose collision box
+// holds the camera (the room around you) is sorted as further than anything else,
+// the biggest first, so it is drawn before every see-through thing standing in it.
+// Only the five calls that sort (0x4C7BA1, 0x4C80A8, 0x4C819C, 0x4C8388, 0x4CA0F6);
+// the four for entities fading in (0x4C7B78, 0x4C7C6A, 0x4C8355, 0x4C84AB) are left
+// as they are: their distance also sets how far they have faded.
+static DWORD CallTarget(DWORD site);
+static void Redirect(DWORD site, void* target);
+static const DWORD INSERT_SORTED = 0x581440;
+static const DWORD kInsertSites[] = { 0x4C7BA1, 0x4C80A8, 0x4C819C, 0x4C8388, 0x4CA0F6 };
+static const float* const CameraPos = (const float*)0x975398;
+static DWORD g_insertFn = INSERT_SORTED;
+static bool g_roomOrderOk = false;
+static const int kRoomFirstMax = 8;
+static short g_roomFirst[kRoomFirstMax];   // models drawn first in the current room (for the log)
+static float g_roomFirstVol[kRoomFirstMax];
+static unsigned g_roomFirstLogs = 0;
+
+static bool CameraInBox(unsigned char* e, const float* col) {
+    const float* m = (const float*)(e + 4);
+    const float d[3] = { CameraPos[0] - m[12], CameraPos[1] - m[13], CameraPos[2] - m[14] };
+    for (int k = 0; k < 3; k++) {
+        const float l = d[0] * m[4 * k] + d[1] * m[4 * k + 1] + d[2] * m[4 * k + 2];
+        if (l < col[4 + k] - 0.5f || l > col[7 + k] + 0.5f) return false;
+    }
+    return true;
+}
+
+static bool __cdecl HookInsertSortedRoom(unsigned char* e, float dist);
+// Timing: how many inserts the five sorting call sites make and how long they take,
+// the game's sorted insert (CLinkList::InsertSorted 0x582BD0: walks from the head
+// while the node's distance is smaller, so O(list length) per insert) included.
+static bool __cdecl HookInsertSorted(unsigned char* e, float dist) {
+    const unsigned long long t0 = TimingStart();
+    const bool r = HookInsertSortedRoom(e, dist);
+    TimingEnd(TS_ALPHA_INSERT, t0);
+    TimingCount(TC_ALPHA_INSERTS);
+    return r;
+}
+
+static bool __cdecl HookInsertSortedRoom(unsigned char* e, float dist) {
+    const int cur = *CurrArea;
+    if (e && cur > 0 && cur <= 18 && cur != AREA_EVERYWHERE && e[ENT_AREA] == cur) {
+        const short model = *(short*)(e + ENT_MODEL);
+        unsigned char* mi = model >= 0 ? ((unsigned char**)MODEL_INFO)[model] : nullptr;
+        const float* col = mi && (mi[0x19] == 1 || mi[0x19] == 3) ? *(const float**)(mi + MI_COLMODEL) : nullptr;   // simple / time model
+        if (col && CameraInBox(e, col)) {
+            const float vol = (col[7] - col[4]) * (col[8] - col[5]) * (col[9] - col[6]);
+            dist = 100000.0f + (vol > 0 ? vol : 0);
+            if (g_roomFirstArea != cur) { g_roomFirstArea = cur; g_nRoomFirst = 0; }
+            bool known = false;
+            for (int i = 0; i < g_nRoomFirst && !known; i++) known = g_roomFirst[i] == model;
+            if (!known && g_nRoomFirst < kRoomFirstMax) {
+                g_roomFirst[g_nRoomFirst] = model;
+                g_roomFirstVol[g_nRoomFirst++] = vol;
+                if (g_roomFirstLogs < 60) {
+                    g_roomFirstLogs++;
+                    Log("Interiors:   area %d: %s (%.0f m3 around the camera) drawn before the plants, glass and other "
+                        "see-through things in it (the game sorted it at %.1f m)", cur, (const char*)(mi + 4), vol,
+                        Dist(CameraPos, (const float*)(e + ENT_POS)));
+                }
+            }
+        }
+    }
+    return ((bool (__cdecl*)(unsigned char*, float))g_insertFn)(e, dist);
+}
+
+static void InstallRoomOrder() {
+    bool ok = *(unsigned char*)INSERT_SORTED == 0x53;   // push ebx
+    DWORD target = CallTarget(kInsertSites[0]);
+    for (DWORD s : kInsertSites) ok = ok && CallTarget(s) == target && target;
+    if (!ok) { Log("Interiors: see-through list code is not v1.0; room walls keep the game's order"); return; }
+    if (target != INSERT_SORTED) Log("Interiors: see-through list hooked by another mod (%08lX); chaining to it", target);
+    g_insertFn = target;
+    for (DWORD s : kInsertSites) Redirect(s, (void*)&HookInsertSorted);
+    g_roomOrderOk = true;
+    Log("Interiors: a room's own walls are drawn before the see-through things standing in it");
+}
+
 // ---------------------------------------------------------------- AutoSwitch
 static bool CeilingAbove(const float* p) {
     const float up[3] = { p[0], p[1], p[2] + 30.0f };
     return !LineOfSightClear(p, up, true, false, false, false, false, true, false);
 }
 
+// Distance from p to the nearest piece of interior `area`: to its collision box (0
+// inside it). Hidden pieces count for their own area. Never the interior's
+// stand-ins for the street: the Ocean View's htl_exterior03 (8 x 58 m, a copy of
+// the hotel front and sidewalk) reaches across the Ocean Drive sidewalk to x 242.5.
+// `copies` false: without the pieces bigger than 150 m either (IslandCopy: the
+// mall's MALLUNDER black box; its roof mlmallroof stays). `copies` true: with those
+// (the mall's black box and roof, the stadium's stands), but without the 1100-1400 m
+// copies of a whole island (the mansion's IslandLOD1/2). The early-out uses the
+// sphere around the box, not the collision sphere, which needn't hold the box's
+// corners. 1e9 if none.
+template <class Each> static float RoomDistIn(Each each, int area, const float* p, bool copies, unsigned char** nearest) {
+    float best = 1e9f;
+    *nearest = nullptr;
+    each([&](unsigned char* e) {
+        if (e[ENT_AREA] != area && !(e[ENT_AREA] == AREA_HIDDEN && RealArea(e) == area)) return;
+        const float* col = ColModel(e);
+        if (!col) return;
+        const float* mn = col + 4, * mx = col + 7;
+        const float* m = (const float*)(e + 4);
+        float lc[3], c[3], r2 = 0;
+        for (int k = 0; k < 3; k++) { lc[k] = 0.5f * (mn[k] + mx[k]); r2 += 0.25f * (mx[k] - mn[k]) * (mx[k] - mn[k]); }
+        for (int k = 0; k < 3; k++) c[k] = m[12 + k] + m[k] * lc[0] + m[4 + k] * lc[1] + m[8 + k] * lc[2];
+        if (Dist(p, c) - sqrtf(r2) >= best) return;
+        float lo[3], hi[3], d2 = 0;
+        WorldBox(m, mn, mx, lo, hi);
+        for (int k = 0; k < 3; k++) {
+            const float o = p[k] < lo[k] ? lo[k] - p[k] : p[k] > hi[k] ? p[k] - hi[k] : 0;
+            d2 += o * o;
+        }
+        const float d = sqrtf(d2);
+        if (d >= best || IsStandIn(ModelName(e))) return;
+        if (copies ? (mx[0] - mn[0] > 600 || mx[1] - mn[1] > 600 || mx[2] - mn[2] > 600) : IslandCopy(e, col)) return;
+        best = d;
+        *nearest = e;
+    });
+    return best;
+}
+
+// area is an interior (Wanted never asks for the city): its list, in pool order.
+static float RoomDist(int area, const float* p, bool copies, unsigned char** nearest) {
+    return RoomDistIn([area](auto f) { ForEachOfArea(area, f); }, area, p, copies, nearest);
+}
+
+// How far from the room counts as out of it, and how close as in it. A room's
+// pieces cover its floor to within 0.85 m (Little Havana's cafe, area 7, whose own
+// floor cof_intfloor is area 13), and the gap between the two kinds of rule keeps
+// the player from flipping between the room and the city on its edge.
+static const float kEnterWithin = 2.0f, kOutOnGround = 1.5f, kOutInAir = 3.0f, kOutAboveRoof = 4.0f;
+
+// Why the last answer of Wanted was given, for the log line of the switch it causes.
+static struct Why { const char* rule; int hitArea; const char* hitName; float dist; const char* nearName; } g_why;
+
+static void Explain(const char* rule, unsigned char* hit, float dist, unsigned char* nearest) {
+    g_why.rule = rule;
+    g_why.hitArea = hit ? RealArea(hit) : -1;
+    g_why.hitName = hit ? ModelName(hit) : "";
+    g_why.dist = dist;
+    g_why.nearName = nearest ? ModelName(nearest) : "none";
+}
+
 // The area the player should be in, or -1 for "leave it as it is".
 static int Wanted(const float* p) {
     const int cur = *CurrArea;
     alignas(16) unsigned char colPoint[64];
-    unsigned char* hit = nullptr;
+    unsigned char* hit = nullptr, * nearest = nullptr;
     const bool found = ProcessVerticalLine(p, p[2] - 60.0f, colPoint, &hit, true, false, false, false, false, true, nullptr);
     if (found && hit) {
         const int a = RealArea(hit);
-        if (a == AREA_EVERYWHERE || a == cur) return -1;
-        if (a != 0) return (cur != 0 || CeilingAbove(p)) ? a : -1;    // standing in another interior
-        // On the city's ground while an interior is set.
-        if (NearestOfArea(cur, p) > 0.0f) return 0;
-        if (cur == g_forced && !CeilingAbove(p)) return 0;
-        return -1;
+        if (a != 0 && a != AREA_EVERYWHERE && a != cur) {
+            // Standing in another interior. Never from the city into one laid over the
+            // street (its floor is under the street: walking there isn't entering it),
+            // never on its copy of the street, never from above its roof.
+            if ((cur == 0 && OverCity(a)) || IsStandIn(ModelName(hit))) return -1;
+            const float d = RoomDist(a, p, true, &nearest);
+            if (d > kEnterWithin || (cur == 0 && !CeilingAbove(p))) return -1;
+            Explain(cur == 0 ? "in the room (its floor below, a ceiling above)" : "in another room (its floor below)", hit, d, nearest);
+            return a;
+        }
+        if (cur == 0) return -1;
+        if (a == cur) {
+            // The room's own piece below: above its roof once clear of all of it.
+            const float d = RoomDist(cur, p, true, &nearest);
+            if (d <= kOutAboveRoof) return -1;
+            Explain("out of the room, above its roof", hit, d, nearest);
+            return 0;
+        }
+        // The city's ground, or ground drawn in every area (Ocean Drive and the beach).
+        const float d = RoomDist(cur, p, false, &nearest);
+        if (d <= kOutOnGround) return -1;
+        Explain(a == 0 ? "out of the room, over the city's ground" : "out of the room, over ground drawn in every area", hit, d, nearest);
+        return 0;
     }
-    if (cur != 0 && NearestOfArea(cur, p) > 30.0f) return 0;   // in the air, far from the room
-    return -1;
+    if (cur == 0) return -1;
+    // Nothing within 60 m below: in the air, over water or high up.
+    const float d = RoomDist(cur, p, false, &nearest);
+    if (d <= kOutInAir) return -1;
+    Explain("out of the room, in the air", nullptr, d, nearest);
+    return 0;
 }
 
 static void Switch(int area, const float* p) {
     const int from = *CurrArea;
+    const bool fromForced = from != 0 && from == g_forced;
+    const Why why = g_why;   // HookRemove and LoadScene below don't call Wanted, but keep it as decided
     const float pos[3] = { p[0], p[1], p[2] };
+    // How long each part of the switch takes, for the log line (the stall at a switch).
+    LARGE_INTEGER q0, q1, q2, qf;
+    QueryPerformanceCounter(&q0);
     *CurrArea = area;
     HookRemove(area);
+    QueryPerformanceCounter(&q1);
+    const unsigned long long scene0 = TimingStart();
     TimerStop();
     LoadScene(pos);
     TimerUpdate();
+    g_sceneCycles += TimingStart() - scene0;
+    TimingEnd(TS_LOAD_SCENE, scene0);
+    QueryPerformanceCounter(&q2);
+    QueryPerformanceFrequency(&qf);
+    const double viewMs = (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart, sceneMs = (q2.QuadPart - q1.QuadPart) * 1000.0 / qf.QuadPart;
     if (area == 0 && !OnMission()) {   // what the door scripts undo on the way out
         StopExtraColour(false);
         if (*CarDensity < 1.0f) *CarDensity = 1.0f;
     }
     g_forced = area != 0 ? area : -1;
-    if (g_switches++ < 50)
-        Log("Interiors: area %d -> %d at %.1f %.1f %.1f (scene loaded)", from, area, pos[0], pos[1], pos[2]);
+    if (g_switches++ < 200) {
+        char hit[64];
+        if (why.hitArea < 0) strcpy(hit, "nothing within 60 m below");
+        else snprintf(hit, sizeof hit, "below: %.24s, area %d", why.hitName, why.hitArea);
+        Log("Interiors: area %d -> %d at %.1f %.1f %.1f (scene loaded): %s (%s; nearest piece of area %d: %.24s, %.1f m)%s; "
+            "took %.1f ms to decide the view, %.1f ms in LoadScene",
+            from, area, pos[0], pos[1], pos[2], why.rule ? why.rule : "?", hit, area != 0 ? area : from, why.nearName,
+            why.dist, from != 0 ? (fromForced ? "; the room was entered by AutoSwitch" : "; the room was set by the game") : "",
+            viewMs, sceneMs);
+    }
 }
 
+static bool g_switchOk = false;   // the game code checks passed
+
 static void UpdateSwitch() {
-    if (!g_cfg.interiors) return;
+    if (!g_switchOk || !g_cfg.interiors) return;
     const int cur = *CurrArea;
     if (g_forced >= 0 && cur != g_forced) g_forced = -1;   // the script changed it since
     unsigned char* ped = nullptr;
@@ -1032,7 +1485,7 @@ __asm__(".text\n.globl _vcmf_fade\n_vcmf_fade:\n"
 static unsigned g_fadeLogs = 0;
 
 extern "C" int vcmf_fade_skip(unsigned char* script) {
-    if (!script) return 0;
+    if (!script || !g_cfg.noDoorFade) return 0;
     const DWORD ip = *(DWORD*)(script + 0x10);   // CRunningScript::m_nIp, just past DO_FADE's parameters
     for (DWORD at : kDoorFades) {
         // 016A, 16-bit time, 8-bit direction: 7 bytes; the main script is at the
@@ -1047,7 +1500,7 @@ extern "C" int vcmf_fade_skip(unsigned char* script) {
 }
 
 static void InstallNoDoorFade() {
-    if (!g_cfg.noDoorFade) { Log("Interiors: door fades on"); return; }
+    // installed even when off: the Modern Fix menu (fixmenu.cpp) turns it on and off
     const DWORD target = CallTarget(FADE_SITE);
     static const unsigned char before[] = { 0xB9, 0x88, 0x46, 0x7E, 0x00 };   // mov ecx, TheCamera
     if (!target || memcmp((void*)(FADE_SITE - 0x10), before, sizeof before)) {
@@ -1070,7 +1523,11 @@ static void Update() {
 
 void InteriorEndOfTick() {
     g_fromIdle = true;
+    g_sceneCycles = 0;
+    const unsigned long long t0 = TimingStart();
     Update();
+    // the Timing line's "interiors" is this file's own work; LoadScene is listed apart
+    TimingEnd(TS_INTERIOR, t0 + g_sceneCycles);
 }
 
 void InteriorAfterPresent() {
@@ -1104,7 +1561,6 @@ static void PatchCmp(DWORD site, void* stub) {
 }
 
 static void InstallView() {
-    if (!g_cfg.interiorView) { Log("Interiors: outside view off"); return; }
     static const unsigned char eaxCmp[] = { 0x3B, 0x05, 0x10, 0x88, 0x97, 0x00, 0x74 };
     static const unsigned char ebxCmp[] = { 0x3B, 0x1D, 0x10, 0x88, 0x97, 0x00, 0x74 };
     bool ok = !memcmp((void*)kEbxSite, ebxCmp, sizeof ebxCmp);
@@ -1136,6 +1592,7 @@ static void InstallView() {
     } else {
         Log("Interiors: building draw calls are not the v1.0 code; overlapping surfaces may flicker");
     }
+    InstallRoomOrder();
     LoadPedRoads();
     // People walked into a room seen from the street (RoomPeople).
     static const unsigned char visJe[] = { 0x0F, 0x84 };
@@ -1154,12 +1611,100 @@ static void InstallView() {
     g_viewOk = true;
     g_viewArea = *CurrArea;
     g_viewDecided = false;
-    Log("Interiors: outside view installed (the city is drawn from inside interiors built into it)");
+    Log("Interiors: outside view installed (the city is drawn from inside interiors built into it) (%s)",
+        g_cfg.interiorView ? "on" : "off");
+}
+
+// ------------------------------------------------- game load, restart, pools made again
+// Every list here (hidden buildings, opened doorways, the stand-in shells, the
+// per-area building lists) holds pointers into the building pools. They are all
+// emptied whenever the game starts over:
+//  - CGame::ShutDownForRestart (0x4A47B0; from the main loop at 0x600542 for Load
+//    Game, quick load and New Game, and at 0x4A4762 when a load fails) and
+//    CGame::ShutDown (0x4A49E0; at 0x60057D / 0x6005C9): first everything is put back
+//    while the buildings are still there (the buildings survive a restart: one left
+//    hidden would stay hidden), then the lists are emptied;
+//  - CGame::Initialise (0x4A4B10, at 0x4A5C56; it makes the pools again,
+//    CPools::Initialise 0x4C0270 at 0x4A4B28) and ReInitGameObjectVariables
+//    (0x4A4850, at 0x4A46F1 after a load and 0x4A4778): the lists are only emptied.
+// Quick load (quicksave.cpp) sets "restart" and "load" and goes through 0x600542.
+struct ResetSite { DWORD site, game; int kind; DWORD target; };
+static ResetSite g_resetSites[] = {
+    { 0x600542, 0x4A47B0, 0, 0 }, { 0x4A4762, 0x4A47B0, 0, 0 },   // CGame::ShutDownForRestart
+    { 0x60057D, 0x4A49E0, 0, 0 }, { 0x6005C9, 0x4A49E0, 0, 0 },   // CGame::ShutDown
+    { 0x4A5C56, 0x4A4B10, 1, 0 },                                 // CGame::Initialise
+    { 0x4A46F1, 0x4A4850, 2, 0 }, { 0x4A4778, 0x4A4850, 2, 0 },   // CGame::ReInitGameObjectVariables
+};
+static unsigned g_resetLogs = 0;
+
+static DWORD ResetTarget(DWORD ret) {
+    for (const ResetSite& s : g_resetSites)
+        if (s.site + 5 == ret) return s.target;
+    return 0;
+}
+
+static void ForgetAll() {
+    g_nHidden = 0;
+    g_nPunched = 0;
+    g_savedUsed = 0;
+    g_nShells = 0;
+    g_lookPieces = 0;
+    g_lookArea = -1;
+    g_pedRoadsOn = -1;
+    g_listsBuilt = false;
+    vcmf_outside = false;
+    vcmf_also = -1;
+    g_viewDecided = false;
+    g_pending = -1;
+    g_forced = -1;
+}
+
+static void __cdecl HookShutDown() {
+    const DWORD target = ResetTarget((DWORD)__builtin_return_address(0));
+    const int hidden = g_nHidden, punched = g_nPunched;
+    if (g_lookArea >= 0) LookEnd();
+    Unpunch();
+    Unhide();
+    const int left = g_nPunched;
+    ForgetAll();
+    if (g_resetLogs++ < 20)
+        Log("Interiors: game %s: %d hidden buildings and %d opened doorways put back first (%d doorway records with no building drawn dropped); every interior list cleared",
+            target == 0x4A49E0 ? "shutting down" : "restarting", hidden, punched, left);
+    if (target) ((void (__cdecl*)())target)();
+}
+
+static bool __cdecl HookInitialise(const char* datFile) {
+    const DWORD target = ResetTarget((DWORD)__builtin_return_address(0));
+    ForgetAll();   // the pools are made again: no pointer from before can be kept
+    if (g_resetLogs++ < 20) Log("Interiors: game initialising (building pools made again); every interior list cleared");
+    return target ? ((bool (__cdecl*)(const char*))target)(datFile) : false;
+}
+
+static void __cdecl HookReInit() {
+    const DWORD target = ResetTarget((DWORD)__builtin_return_address(0));
+    ForgetAll();
+    if (target) ((void (__cdecl*)())target)();
+    ForgetAll();
+}
+
+static void InstallGameResetHooks() {
+    int done = 0;
+    for (ResetSite& s : g_resetSites) {
+        s.target = CallTarget(s.site);
+        if (!s.target) { Log("Interiors: game restart code at %08lX is not v1.0; lists not cleared there", s.site); continue; }
+        if (s.target != s.game) Log("Interiors: call at %08lX hooked by another mod (%08lX); chaining to it", s.site, s.target);
+        Redirect(s.site, s.kind == 0 ? (void*)&HookShutDown : s.kind == 1 ? (void*)&HookInitialise : (void*)&HookReInit);
+        done++;
+    }
+    Log("Interiors: hidden / doorway / area lists cleared on game load, restart and shutdown (%d of %d calls)",
+        done, (int)(sizeof g_resetSites / sizeof *g_resetSites));
 }
 
 void InstallInterior() {
+    InstallGameResetHooks();
     InstallNoDoorFade();
-    if (!g_cfg.interiors && !g_cfg.interiorView) { Log("Interiors: off"); return; }
+    // Installed even when both are off: the Modern Fix menu (fixmenu.cpp) turns them on
+    // and off while playing.
     struct { DWORD addr; unsigned char bytes[8]; int len; } checks[] = {
         { 0x4D8B00, { 0x53, 0x56, 0x55, 0x83, 0xEC, 0x40, 0x66, 0x83 }, 8 },   // CWorld::ProcessVerticalLine
         { 0x40DAA0, { 0x53, 0x8B, 0x1D, 0x40, 0xF2, 0x97, 0x00 }, 7 },         // RemoveBuildingsNotInArea
@@ -1170,11 +1715,11 @@ void InstallInterior() {
     };
     for (auto& c : checks) {
         if (memcmp((void*)c.addr, c.bytes, c.len)) {
-            g_cfg.interiors = g_cfg.interiorView = false;
             Log("Interiors: game code at %08lX is not the v1.0 code; not installed", c.addr);
             return;
         }
     }
     InstallView();
-    if (g_cfg.interiors) Log("Interiors: auto switch installed (the drawn area follows the player)");
+    g_switchOk = true;
+    Log("Interiors: auto switch installed (the drawn area follows the player) (%s)", g_cfg.interiors ? "on" : "off");
 }
