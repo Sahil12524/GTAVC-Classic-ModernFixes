@@ -31,6 +31,9 @@
 static const DWORD INIT_VEHICLES_IMM = 0x410795, INIT_MEMORY_IMM = 0x41079F;
 static int* const MemoryAvailable = (int*)0x94DD54;
 static int* const DesiredVehicles = (int*)0x6867A0;
+static const DWORD ALPHA_LIST_PUSH = 0x5828DB;   // push 200 (mov ecx, 0xA0FD84 at -15)
+static const int kAlphaEntities = kMaxAlphaEntities;
+static bool g_alphaPatched;
 static const DWORD LOD_FMUL = 0x46DEC3;   // fmul dword ptr [0x690220]
 static float* const LodDistScale = (float*)0x690220;
 static const DWORD SET_RW_CAMERA = 0x581840;
@@ -45,18 +48,27 @@ static float* const kVehicleDists[] = { (float*)0x974B00, (float*)0x974B10, (flo
 // it becomes 300 m times Scale. More full-detail models in view means more entries
 // in CRenderer's visible list (0x7D54F8, 2000 entries, count 0xA0D1E4), which the
 // game fills without checking: its three writes (0x4C7613, 0x4C77ED, 0x4C85AD:
-// mov eax,[count]; inc [count]; mov [list+eax*4], reg) call a stub that stops at
-// 1990 instead.
+// mov eax,[count]; inc [count]; mov [list+eax*4], reg) call a stub instead. With
+// twice the detail distance a busy area (downtown) filled all 2000 entries, and
+// whatever came after was not drawn - a road piece right under the player
+// included, as the scan doesn't go nearest first. So the list is moved to one of
+// 16000 entries here: the stubs add to it (stopping at 15990), and the three reads
+// of the list (0x4C9F83, 0x4CA1BB, 0x4CA203: mov reg,[list+idx*4]) point at it.
 static float* const LodDistance = (float*)0x69022C;
 static const DWORD kVisAdds[] = { 0x4C7613, 0x4C77ED, 0x4C85AD };
-extern "C" { void vcmf_vis_add_ebp(); void vcmf_vis_add_esi(); }
+extern "C" {
+    void vcmf_vis_add_ebp(); void vcmf_vis_add_esi();
+    void* g_visList[16000];
+    volatile unsigned g_visDropped = 0;
+}
+static const DWORD kVisReads[] = { 0x4C9F83, 0x4CA1BB, 0x4CA203 };
 __asm__(".text\n"
         ".globl _vcmf_vis_add_ebp\n_vcmf_vis_add_ebp:\n"
-        "  movl 0xA0D1E4, %eax\n  cmpl $1990, %eax\n  jae 1f\n"
-        "  movl %ebp, 0x7D54F8(,%eax,4)\n  incl 0xA0D1E4\n1: ret\n"
+        "  movl 0xA0D1E4, %eax\n  cmpl $15990, %eax\n  jae 1f\n"
+        "  movl %ebp, _g_visList(,%eax,4)\n  incl 0xA0D1E4\n  ret\n1: incl _g_visDropped\n  ret\n"
         ".globl _vcmf_vis_add_esi\n_vcmf_vis_add_esi:\n"
-        "  movl 0xA0D1E4, %eax\n  cmpl $1990, %eax\n  jae 2f\n"
-        "  movl %esi, 0x7D54F8(,%eax,4)\n  incl 0xA0D1E4\n2: ret\n");
+        "  movl 0xA0D1E4, %eax\n  cmpl $15990, %eax\n  jae 2f\n"
+        "  movl %esi, _g_visList(,%eax,4)\n  incl 0xA0D1E4\n  ret\n2: incl _g_visDropped\n  ret\n");
 
 // The far clip. Idle (0x4A6032) gives the RenderWare camera the weather's far clip
 // (CTimeCycle::m_fCurrentFarClip, 0x9B6A6C) each frame: RwCameraSetFarClipPlane
@@ -65,13 +77,37 @@ __asm__(".text\n"
 static const DWORD FARCLIP_SITE = 0x4A6032, RW_SET_FAR = 0x64A930;
 static DWORD g_setFarFn = 0;
 
+// High up. From a helicopter or plane the ground is mostly further away than the
+// weather's far clip (300 - 1000 m), so above a few hundred metres the city was
+// fog-grey LODs fading into nothing. Above 100 m the far clip grows with the
+// camera's height (2.5 m per metre, up to 4 km), and the fog's start - Idle gives
+// the RenderWare camera the weather's (CTimeCycle::m_fCurrentFogStart 0x978660,
+// fld at 0x4A6037, stored at camera +0x88) - moves out by as much, so the fog band
+// keeps its width at the new end. On the ground nothing changes.
+static const DWORD FOG_FLD = 0x4A6037;   // fld dword ptr [0x978660]
+static float* const FogStart = (float*)0x978660;
+static float g_fogStart = 0.0f;
+static bool g_fogOk = false;
+
 static void* __cdecl HookSetFarClip(void* camera, float farClip) {
-    return ((void* (__cdecl*)(void*, float))g_setFarFn)(camera, farClip * g_cfg.farClip);
+    const float base = farClip * g_cfg.farClip;
+    float f = base;
+    if (g_cfg.highView) {
+        const float h = *(const float*)0x7E46C0;   // TheCamera's height
+        if (h > 100.0f && h < 10000.0f) {
+            float want = base + (h - 100.0f) * 2.5f;
+            if (want > 4000.0f) want = 4000.0f;
+            if (want > f) f = want;
+        }
+    }
+    g_fogStart = *FogStart + (f - base);
+    return ((void* (__cdecl*)(void*, float))g_setFarFn)(camera, f);
 }
 
 static float g_lodScale = 1.2f;   // read by the patched fmul
 static DWORD g_setCameraFn = 0;
 static bool g_drawOk = false;
+static bool g_visOk = false;   // the 300 m limit is ours to set (LodDistance)
 
 static void Write(DWORD site, const void* bytes, int len) {
     DWORD old;
@@ -86,6 +122,7 @@ static DWORD CallTarget(DWORD site) {
     return p[0] == 0xE8 ? site + 5 + *(const int*)(p + 1) : 0;
 }
 
+
 static int MemoryBytes() { return g_cfg.streamMemoryMB * 1024 * 1024; }
 
 // DllMain: before CStreaming::Init runs.
@@ -97,6 +134,17 @@ void PatchStreamingEarly() {
     if (g_cfg.streamMemoryMB && !memcmp((void*)(INIT_MEMORY_IMM - 6), memory, sizeof memory)) {
         const int bytes = MemoryBytes();
         Write(INIT_MEMORY_IMM, &bytes, 4);
+    }
+    // CVisibilityPlugins::InitAlphaLists: the sorted list of see-through things (trees, palms,
+    // fences) holds 200. Past that, InsertEntityIntoSortedList fails and the entity is drawn
+    // unsorted with the solid ones, so a near palm drawn first blanks the leaves behind its
+    // see-through parts (leaves "floating" in a box of sky). Make room for 1000.
+    static const unsigned char alpha[] = { 0xB9, 0x84, 0xFD, 0xA0, 0x00 };
+    if (!memcmp((void*)(ALPHA_LIST_PUSH - 15), alpha, sizeof alpha) && *(unsigned char*)ALPHA_LIST_PUSH == 0x68
+        && *(int*)(ALPHA_LIST_PUSH + 1) == 200) {
+        const int n = kAlphaEntities;
+        Write(ALPHA_LIST_PUSH + 1, &n, 4);
+        g_alphaPatched = true;
     }
 }
 
@@ -112,10 +160,25 @@ void InstallDrawDistance() {
     if (g_cfg.vehicleModels && *DesiredVehicles < g_cfg.vehicleModels) *DesiredVehicles = g_cfg.vehicleModels;
     Log("Streaming: %d MB for models (game: 45), %d vehicle models kept loaded (game: 25)",
         *MemoryAvailable / (1024 * 1024), *DesiredVehicles);
+    Log(g_alphaPatched ? "DrawDistance: see-through list (trees, palms) holds %d (game: 200)"
+                       : "DrawDistance: see-through list code is not v1.0; holds 200", kAlphaEntities);
+
+    // Project2DFX (VCLodLights.asi) does the same job: its own draw distance (2.5x),
+    // detail distance and view distance (+1000 m on the far clip), with Open Limit
+    // Adjuster giving the renderer's visible list the room. Both together stacked the
+    // multipliers, and its adjuster had already moved the visible list (so the 600 m
+    // limit couldn't be installed). With it loaded, distances are left to it; its
+    // settings are in VCLodLights.cfg. Streaming memory and the see-through list stay.
+    if (GetModuleHandleA("VCLodLights.asi")) {
+        Log("DrawDistance: Project2DFX is installed; draw, detail and view distance are left to it (VCLodLights.cfg)");
+        return;
+    }
 
     // far clip (independent of Scale)
     static const unsigned char farPush[] = { 0xFF, 0x35, 0x6C, 0x6A, 0x9B, 0x00, 0x50 };   // push [farclip]; push eax
-    if (g_cfg.farClip != 1.0f) {
+    // installed even at 1: the Modern Fix menu (fixmenu.cpp) changes Scale and FarClip
+    // while playing, and both are read on every frame
+    {
         const DWORD t = CallTarget(FARCLIP_SITE);
         if (t && !memcmp((void*)(FARCLIP_SITE - 7), farPush, sizeof farPush)) {
             if (t != RW_SET_FAR) Log("DrawDistance: far clip call hooked by another mod (%08lX); chaining to it", t);
@@ -124,12 +187,22 @@ void InstallDrawDistance() {
             *(int*)(call + 1) = (int)((DWORD)&HookSetFarClip - (FARCLIP_SITE + 5));
             Write(FARCLIP_SITE, call, 5);
             Log("DrawDistance: far clip x%.2f of the weather's", g_cfg.farClip);
+            static const unsigned char fld[] = { 0xD9, 0x05, 0x60, 0x86, 0x97, 0x00 };
+            if (!memcmp((void*)FOG_FLD, fld, sizeof fld)) {
+                g_fogStart = *FogStart;
+                unsigned char patched[6] = { 0xD9, 0x05 };
+                float* p = &g_fogStart;
+                memcpy(patched + 2, &p, 4);
+                Write(FOG_FLD, patched, 6);
+                g_fogOk = true;
+            }
+            Log("DrawDistance: high up the view reaches further with the height (%s; fog moved out with it: %s)",
+                g_cfg.highView ? "on" : "off", g_fogOk ? "yes" : "no, fog code not v1.0");
         } else {
             Log("DrawDistance: far clip code is not v1.0; not changed");
         }
     }
 
-    if (g_cfg.drawDistance == 1.0f) { Log("DrawDistance: game's own"); return; }
     static const unsigned char fmul[] = { 0xD8, 0x0D, 0x20, 0x02, 0x69, 0x00 };
     bool camOk = true;
     const DWORD target = CallTarget(kCameraSites[0]);
@@ -162,7 +235,12 @@ void InstallDrawDistance() {
         const unsigned char* p = (const unsigned char*)s + 11;
         addsOk = addsOk && p[0] == 0x89 && (p[1] == 0x2C || p[1] == 0x34) && p[2] == 0x85;
     }
+    for (DWORD r : kVisReads) {   // mov reg, [idx*4 + list]: 8B modrm sib, then the address
+        const unsigned char* p = (const unsigned char*)r - 3;
+        addsOk = addsOk && p[0] == 0x8B && *(const DWORD*)r == 0x7D54F8;
+    }
     if (addsOk) {
+        for (DWORD r : kVisReads) { const DWORD a = (DWORD)&g_visList[0]; Write(r, &a, 4); }
         for (DWORD s : kVisAdds) {
             const bool esi = ((const unsigned char*)s)[12] == 0x34;
             unsigned char code[18];
@@ -172,7 +250,8 @@ void InstallDrawDistance() {
             Write(s, code, sizeof code);
         }
         *LodDistance = 300.0f * g_cfg.drawDistance;
-        Log("DrawDistance: full detail out to %.0f m (game: 300 m); visible list guarded at 1990 of 2000",
+        g_visOk = true;
+        Log("DrawDistance: full detail out to %.0f m (game: 300 m); visible list holds 16000 (game: 2000)",
             *LodDistance);
     } else {
         Log("DrawDistance: renderer code is not v1.0; the 300 m limit stays");
@@ -183,4 +262,11 @@ void InstallDrawDistance() {
 // Every frame: follow the menu slider.
 void DrawDistanceFrame() {
     if (g_drawOk) g_lodScale = *LodDistScale * g_cfg.drawDistance;
+    if (g_visOk) *LodDistance = 300.0f * g_cfg.drawDistance;
+    static unsigned logged = 0;
+    if (g_visDropped && logged < 3 && g_visDropped != logged) {
+        logged++;
+        Log("DrawDistance: the visible list was full (16000); %u things not drawn", g_visDropped);
+        g_visDropped = 0;
+    }
 }

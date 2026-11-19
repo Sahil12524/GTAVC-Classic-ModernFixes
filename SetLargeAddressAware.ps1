@@ -4,9 +4,13 @@
 #   powershell -ExecutionPolicy Bypass -File SetLargeAddressAware.ps1 [-Undo]
 param([switch]$Undo)
 
-$exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'gta-vc.exe'
-$backup = Join-Path (Split-Path $PSScriptRoot -Parent) 'gta-vc (Before LAA).exe'
-if (-not (Test-Path $exe)) { throw "gta-vc.exe not found next to this folder: $exe" }
+# The game folder: this script's own folder (copied next to gta-vc.exe), else the
+# folder above it (run from VCModernFix\).
+$gameDir = $PSScriptRoot
+if (-not (Test-Path (Join-Path $gameDir 'gta-vc.exe'))) { $gameDir = Split-Path $PSScriptRoot -Parent }
+$exe = Join-Path $gameDir 'gta-vc.exe'
+$backup = Join-Path $gameDir 'gta-vc (Before LAA).exe'
+if (-not (Test-Path $exe)) { throw "gta-vc.exe not found in $PSScriptRoot or the folder above it" }
 if (Get-Process gta-vc -ErrorAction SilentlyContinue) { throw 'Close the game first.' }
 if (-not (Test-Path $backup)) { Copy-Item $exe $backup; Write-Host "Backup: $backup" }
 

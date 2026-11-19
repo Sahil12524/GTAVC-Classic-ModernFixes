@@ -4,3 +4,4 @@
 void InstallPhoneSkip();      // first frame, with the other game hooks
 void PhoneSkipFrame();        // start of every frame (fixedtick.cpp): reads the key
 void PhoneSkipBeforeTick();   // start of a game update, before the scripts run (fixedtick.cpp)
+bool MissionAudioSkip(bool on);   // mission speech is skipped while on; false if the hooks aren't installed

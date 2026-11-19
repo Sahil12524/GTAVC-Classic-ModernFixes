@@ -8,8 +8,9 @@
 # Runtime files
 *.log
 
-# Local reverse-engineering scratch scripts (machine-specific paths, need local data files)
-tools/
+# Local reverse-engineering scratch scripts (machine-specific paths, need local data files);
+# the mod manager in tools/ (VCModManager.ps1 / .bat) is published
+tools/*.py
 *.pkl
 
 # Editor / OS

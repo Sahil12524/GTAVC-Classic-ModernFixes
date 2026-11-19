@@ -13,12 +13,78 @@
 // served from the same physical pages. It costs address space (about 640 MB of the
 // 4 GB the large-address-aware exe has) and RAM, nothing else: no game code is
 // changed. If a file can't be mapped, it still gets the plain file-cache warm-up.
+// The views are only kept when the first read shows a slow disk (500 ms or more for
+// the file): read in tens of ms, the file was already in the Windows file cache (or
+// is on a fast SSD), and the game's reads are served from there without the views.
 // The radio and other audio streams are read into the file cache afterwards.
 #include "preload.h"
 #include "config.h"
 #include <windows.h>
 
 static const char* const kFiles[] = { "audio\\SFX.RAW", "models\\gta3.img" };
+
+// The views take about 640 MB of address space for the whole session. That only
+// fits when gta-vc.exe is large address aware (4 GB on 64-bit Windows; without the
+// flag the game has 2 GB, and the model memory, MemoryMB, plus the game's own data
+// need most of it). So the files are mapped only when the exe has the flag and the
+// address space left still holds the views, the model memory still to be used and
+// 512 MB for everything else; otherwise they only get the file-cache warm-up.
+static bool g_mapFiles = true;
+
+static unsigned long long FileBytes(const char* dir, char* slash) {
+    unsigned long long total = 0;
+    for (const char* name : kFiles) {
+        lstrcpyA(slash, name);
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        if (GetFileAttributesExA(dir, GetFileExInfoStandard, &a))
+            total += (unsigned long long)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+    }
+    return total;
+}
+
+static void MapsFit(const char* dir, char* slash) {
+    const unsigned char* exe = (const unsigned char*)GetModuleHandleA(nullptr);
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(exe + ((const IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE)) {
+        g_mapFiles = false;
+        Log("Preload: gta-vc.exe is not large address aware (2 GB); files only warmed in the file cache, not kept mapped "
+            "(SetLargeAddressAware.ps1 sets the flag)");
+        return;
+    }
+    MEMORYSTATUSEX ms = { sizeof ms };
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    const unsigned long long files = FileBytes(dir, slash);
+    const unsigned long long models = (unsigned long long)(g_cfg.streamMemoryMB > 0 ? g_cfg.streamMemoryMB : 45) << 20;
+    const unsigned long long need = files + models + (512ull << 20);
+    if (ms.ullAvailVirtual < need) {
+        g_mapFiles = false;
+        Log("Preload: %u MB of address space left, %u MB needed for the mapped files (%u MB), model memory (%u MB) and "
+            "512 MB headroom; files only warmed in the file cache", (unsigned)(ms.ullAvailVirtual >> 20),
+            (unsigned)(need >> 20), (unsigned)(files >> 20), (unsigned)(models >> 20));
+    }
+}
+
+// Once a minute, how much memory the game uses: its committed private memory, the
+// RAM it has in use, and the address space left of its 2 or 4 GB.
+typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage,
+                 QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage,
+                 PeakPagefileUsage, PrivateUsage; } MemCounters;
+static DWORD WINAPI MemoryLogThread(void*) {
+    typedef BOOL (WINAPI* GetPMI_t)(HANDLE, MemCounters*, DWORD);
+    auto get = (GetPMI_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    for (;;) {
+        Sleep(60000);
+        MEMORYSTATUSEX ms = { sizeof ms };
+        GlobalMemoryStatusEx(&ms);
+        MemCounters pm = { sizeof pm };
+        if (get && get(GetCurrentProcess(), &pm, sizeof pm))
+            Log("Memory: %u MB committed, %u MB in RAM (peak %u MB), %u of %u MB address space free",
+                (unsigned)(pm.PrivateUsage >> 20), (unsigned)(pm.WorkingSetSize >> 20), (unsigned)(pm.PeakWorkingSetSize >> 20),
+                (unsigned)(ms.ullAvailVirtual >> 20), (unsigned)(ms.ullTotalVirtual >> 20));
+        else
+            Log("Memory: %u of %u MB address space free", (unsigned)(ms.ullAvailVirtual >> 20), (unsigned)(ms.ullTotalVirtual >> 20));
+    }
+}
 
 static void NormalMemoryPriority() {
     // Background mode lowers memory priority too, which would put the cached pages
@@ -30,7 +96,35 @@ static void NormalMemoryPriority() {
     set(GetCurrentThread(), 0 /* ThreadMemoryPriority */, &priority, sizeof priority);
 }
 
+// The reads wait until the game has finished loading. Started at DLL load, they ran
+// while the game read its own data files and models\gta3.img for the start: on a
+// hard disk (the owner's E: is a 2.5" laptop HDD) the 1.3 GB read here and the game's
+// boot reads pulled the disk head back and forth, and a cold start took 20-50 s on
+// the loading screen instead of 5-7 s. Background I/O priority does not stop that: the
+// game's reads still wait for the seek away from this thread's position. So the thread
+// sleeps until the game state is 9 (playing) and has stayed so for 3 s; the menu, the
+// intro videos and the loading screen have the disk to themselves.
+static const DWORD GAME_STATE = 0x9B5F08;   // 9 = playing
+static void WaitForGameLoaded() {
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    DWORD playingSince = 0;
+    for (;;) {
+        const DWORD now = GetTickCount();
+        if (*(volatile int*)GAME_STATE == 9) {
+            if (!playingSince) playingSince = now;
+            else if (now - playingSince >= 3000) break;
+        } else playingSince = 0;
+        Sleep(100);
+    }
+    QueryPerformanceCounter(&t1);
+    Log("Preload: started %u s after launch, once the game had been playing for 3 s (the intro, menu and loading "
+        "screen read the disk alone)", (unsigned)((t1.QuadPart - t0.QuadPart) / f.QuadPart));
+}
+
 static DWORD WINAPI PreloadThread(void*) {
+    WaitForGameLoaded();
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);   // low CPU and I/O priority
     NormalMemoryPriority();
     const DWORD chunk = 1 << 20;
@@ -42,6 +136,7 @@ static DWORD WINAPI PreloadThread(void*) {
     while (slash > dir && slash[-1] != '\\') slash--;
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
+    MapsFit(dir, slash);
     for (const char* name : kFiles) {
         lstrcpyA(slash, name);
         HANDLE h = CreateFileA(dir, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -55,10 +150,19 @@ static DWORD WINAPI PreloadThread(void*) {
         QueryPerformanceCounter(&t1);
         const unsigned readMs = (unsigned)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
 
-        // keep it resident: a read-only view of the whole file, every page touched
+        // keep it resident: a read-only view of the whole file, every page touched.
+        // Only when the read shows a slow disk. A read under kCachedMs (300 MB in tens
+        // of ms: already in the Windows file cache, or an SSD) means the game's own reads
+        // of the file are served from the cache or a fast disk anyway: the view would
+        // only add the same pages to the game's working set and take 300 MB of its
+        // address space, so the file is left to the file cache.
+        static const unsigned kCachedMs = 500;
+        const bool fastRead = readMs < kCachedMs;
         bool kept = false;
         DWORD err = 0;
-        if (GetFileSizeEx(h, &size) && size.HighPart == 0 && size.LowPart) {
+        if (!g_mapFiles || fastRead) {
+            // map nothing (MapsFit said why, or the read was fast); the read above warmed the file cache
+        } else if (GetFileSizeEx(h, &size) && size.HighPart == 0 && size.LowPart) {
             HANDLE map = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
             if (!map) err = GetLastError();
             if (map) {
@@ -73,8 +177,10 @@ static DWORD WINAPI PreloadThread(void*) {
         }
         CloseHandle(h);
         Log("Preload: %s, %u MB read in %u ms, %s", name, (unsigned)(total >> 20), readMs,
-            kept ? "kept in memory for the session" : "in the file cache only");
-        if (!kept) Log("Preload: mapping %s failed, error %lu", name, err);
+            kept ? "slow disk (over 500 ms): kept in memory for the session"
+                 : fastRead ? "cached or fast disk (under 500 ms): left to the Windows file cache, not kept mapped"
+                            : "in the file cache only");
+        if (!kept && g_mapFiles && !fastRead) Log("Preload: mapping %s failed, error %lu", name, err);
     }
     // Radio stations (.adf) and the ambience / cutscene streams (.mp3): about 700 MB,
     // read by the sound system a few KB at a time while they play, partly on the game
@@ -114,6 +220,7 @@ static DWORD WINAPI PreloadThread(void*) {
 }
 
 void StartPreload() {
+    if (HANDLE t = CreateThread(nullptr, 0, MemoryLogThread, nullptr, 0, nullptr)) CloseHandle(t);
     if (!g_cfg.preload) { Log("Preload: off"); return; }
     if (HANDLE t = CreateThread(nullptr, 0, PreloadThread, nullptr, 0, nullptr)) CloseHandle(t);
 }

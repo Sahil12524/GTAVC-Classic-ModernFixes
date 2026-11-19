@@ -94,12 +94,30 @@ static bool InGame() {
     return w && GetForegroundWindow() == w;
 }
 
+// On water: in a boat, or where the water map has water (CWaterLevel::GetWaterLevel)
+// and either in it (below the surface + 1 m: swimming, sinking) or above it with
+// no solid ground over the water below (a vertical line down through buildings and
+// objects, CWorld::ProcessVerticalLine 0x4D8B00, finds only the seabed or nothing).
+// That catches walking on water (a trainer's), hovering or flying low over it,
+// and a car driven onto it, while a pier, jetty or beach above the water level
+// counts as land.
+static const auto ProcessVerticalLine = (bool (__cdecl*)(const float* point, float zStop, void* colPoint,
+    unsigned char** entity, bool b, bool v, bool p, bool o, bool d, bool ignoreSeeThrough, void* poly))0x4D8B00;
+
 static bool OnWater(unsigned char* ped) {
     unsigned char* veh = FindPlayerVehicle();
     if (veh && *(int*)(veh + VEH_TYPE) == 1) return true;   // in a boat
     const float* p = (const float*)((veh ? veh : ped) + ENT_POS);
     float level;
-    return WaterLevel(p[0], p[1], p[2], &level, true) && p[2] < level + 1.0f;
+    if (!WaterLevel(p[0], p[1], p[2], &level, true)) return false;   // no water here
+    if (p[2] < level + 1.0f) return true;                            // in the water
+    static const unsigned char lineCode[] = { 0x53, 0x56, 0x55, 0x83, 0xEC, 0x40, 0x66, 0x83 };
+    static const bool lineOk = !memcmp((void*)0x4D8B00, lineCode, sizeof lineCode);
+    if (!lineOk) return false;                                       // not v1.0: the surface test only
+    alignas(16) unsigned char colPoint[64];
+    unsigned char* hit = nullptr;
+    const bool ground = ProcessVerticalLine(p, level - 2.0f, colPoint, &hit, true, false, false, true, false, true, nullptr);
+    return !ground || ((const float*)colPoint)[2] < level - 0.1f;    // only the seabed (or nothing) below
 }
 
 // The save's name (shown in Load Game) is the text GenericSave looks up for the
@@ -322,6 +340,13 @@ static void BringBackCar() {
     if (g_car.health > 0.0f) *(float*)(veh + VEH_HEALTH) = g_car.health;
     veh[ENT_STATUS] = (veh[ENT_STATUS] & 7) | 0x20;   // STATUS_ABANDONED, like the spawn cheat
     *(int*)(veh + VEH_DOORLOCK) = 1;                  // unlocked
+    // Make room where it stands, as a script's CREATE_CAR does:
+    // CTheScripts::ClearSpaceForMissionEntity (0x45F180, cdecl: position, the new
+    // entity) removes the random cars and peds its collision touches (never the
+    // player, 0x4F4930, nor anything the game won't delete, 0x4FFEF0 / 0x5BA960).
+    static const unsigned char clearSpace[] = { 0x53, 0x56, 0x57, 0x55, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00 };
+    if (!memcmp((void*)0x45F180, clearSpace, sizeof clearSpace))
+        ((void (__cdecl*)(const float*, void*))0x45F180)((const float*)(veh + 0x34), veh);
     WorldAdd(veh);
     SetObjective(ped, 0x12, veh);   // OBJECTIVE_ENTER_CAR_AS_DRIVER, as opcode 0369 does
     WarpIntoCar(ped, veh);
@@ -340,8 +365,9 @@ static const wchar_t* Blocked(unsigned char* ped) {
     return nullptr;
 }
 
-// For the save only: the player stands at `at` (a safehouse's save point), in the
-// city (area 0), facing `heading`; everything is put back right after.
+// For the save only: the player stands at `at` (x, y, z of the ground, heading in
+// degrees: a safehouse's standing spot), in the city (area 0); everything is put
+// back right after.
 struct AtSavePoint {
     unsigned char* ped = nullptr;
     unsigned char matrix[0x40], area;
@@ -353,10 +379,13 @@ struct AtSavePoint {
         area = p[ENT_AREA];
         currArea = *(int*)CURR_AREA;
         float* m = (float*)(p + 4);
-        m[0] = 1; m[1] = 0; m[2] = 0;   // upright, facing north like a fresh spawn
-        m[4] = 0; m[5] = 1; m[6] = 0;
-        m[8] = 0; m[9] = 0; m[10] = 1;
-        m[12] = at[0]; m[13] = at[1]; m[14] = at[2] + 0.5f;   // a little above the marker
+        const float h = at[3] * 0.017453293f;   // game heading: forward = (-sin h, cos h)
+        const float sn = __builtin_sinf(h), cs = __builtin_cosf(h);
+        m[0] = cs;  m[1] = sn; m[2] = 0;   // right, upright
+        m[4] = -sn; m[5] = cs; m[6] = 0;   // forward
+        m[8] = 0;   m[9] = 0;  m[10] = 1;
+        // ground height + 1 m: where SET_PLAYER_COORDINATES puts a ped's centre
+        m[12] = at[0]; m[13] = at[1]; m[14] = at[2] + 1.0f;
         p[ENT_AREA] = 0;
         *(int*)CURR_AREA = 0;
     }
@@ -479,38 +508,37 @@ static struct {
 } g_auto;
 
 // Like a safehouse save, an auto save puts you at a safehouse when loaded: the
-// save point of the nearest safehouse you own. Each owned safehouse runs its save
-// script, PSAVE1-10 (started when it is bought; PSAVE1, the Ocean View hotel, from
-// the start), found in CTheScripts::pActiveScripts (0x975338; CRunningScript: next
-// +0, name +8). Their save points are where those scripts create the save pickup
-// (opcode 0213, model PICKUPSAVE); PSAVE5 takes its point from $570-$572.
-static const DWORD ACTIVE_SCRIPTS = 0x975338, SCRIPT_SPACE = 0x821280;
-static const struct { const char* name; float x, y, z; } kSavePoints[] = {
-    { "psave1", 219.3f, -1273.5f, 11.5f },  { "psave2", -378.3f, -597.2f, 25.8f },
-    { "psave3", -1033.8f, -846.9f, 13.0f }, { "psave4", -992.7f, 193.4f, 11.4f },
-    { "psave5", 0, 0, 0 },                  { "psave6", -664.1f, -1476.3f, 13.8f },
-    { "psave7", -878.5f, -575.1f, 11.2f },  { "psave8", -1059.6f, -282.2f, 11.2f },
-    { "psave9", 0.0f, 957.9f, 11.1f },      { "psave10", 499.5f, -66.9f, 11.4f },
+// nearest safehouse you own. Each owned safehouse runs its save script, PSAVE1-10
+// (started when it is bought; PSAVE1, the Ocean View hotel, from the start), found
+// in CTheScripts::pActiveScripts (0x975338; CRunningScript: next +0, name +8).
+// The player is saved where that script itself stands them for a save, off the
+// save pickup (on the pickup the safehouse would ask to save again at once):
+// its SET_PLAYER_COORDINATES (0055) and SET_PLAYER_HEADING (0171) in main.scm
+// (PSAVE2-10 just before their save gosub; PSAVE1 the spot after its save,
+// 0x10929). The pickups themselves are 3-16 m away.
+static const DWORD ACTIVE_SCRIPTS = 0x975338;
+static const struct { const char* name; float x, y, z, heading; } kSavePoints[] = {
+    { "psave1",   223.1f, -1276.7f, 11.0f, 258.0f },  { "psave2",  -378.5f, -589.1f, 24.6f,   0.0f },
+    { "psave3", -1028.3f,  -851.9f, 12.3f, 226.0f },  { "psave4",  -996.5f,  194.1f, 10.6f,  80.0f },
+    { "psave5",   100.9f, -1470.6f,  9.4f, 218.0f },  { "psave6",  -660.0f, -1477.8f, 13.0f, 248.0f },
+    { "psave7",  -872.0f,  -573.4f, 10.4f, 277.0f },  { "psave8", -1056.7f, -279.7f, 10.6f, 273.0f },
+    { "psave9",     1.4f,   960.7f, 10.2f, 274.3f },  { "psave10",  492.0f,  -80.6f, 10.7f, 224.5f },
 };
 
 static void NearestSavePoint(unsigned char* ped, float* out) {
     const float* p = (const float*)(ped + ENT_POS);
     float best = 1e30f;
     const char* which = nullptr;
-    out[0] = kSavePoints[0].x; out[1] = kSavePoints[0].y; out[2] = kSavePoints[0].z;   // Ocean View
+    // k: a const reference to a table entry
+    auto take = [&](decltype(kSavePoints[0]) k) { out[0] = k.x; out[1] = k.y; out[2] = k.z; out[3] = k.heading; };
+    take(kSavePoints[0]);   // Ocean View
     int guard = 0;
     for (unsigned char* s = *(unsigned char**)ACTIVE_SCRIPTS; s && guard < 200; s = *(unsigned char**)s, guard++) {
         const char* name = (const char*)(s + 8);
         for (const auto& k : kSavePoints) {
             if (lstrcmpiA(name, k.name)) continue;
-            float pt[3] = { k.x, k.y, k.z };
-            if (k.x == 0 && k.y == 0) {   // PSAVE5: from its variables
-                const float* v = (const float*)(SCRIPT_SPACE + 570 * 4);
-                pt[0] = v[0]; pt[1] = v[1]; pt[2] = v[2];
-                if (pt[0] == 0 && pt[1] == 0) continue;
-            }
-            const float dx = pt[0] - p[0], dy = pt[1] - p[1], d = dx * dx + dy * dy;
-            if (d < best) { best = d; which = k.name; out[0] = pt[0]; out[1] = pt[1]; out[2] = pt[2]; }
+            const float dx = k.x - p[0], dy = k.y - p[1], d = dx * dx + dy * dy;
+            if (d < best) { best = d; which = k.name; take(k); }
         }
     }
     Log("AutoSave: saving at the save point of %s (%.0f, %.0f, %.0f)", which ? which : "psave1 (no safehouse found)",
@@ -549,7 +577,7 @@ static void AutoSave() {
     g_auto.onMission = on;
     if (!g_auto.pending || on || now - g_auto.since < 4000 || Blocked(ped)) return;
     g_auto.pending = false;
-    float at[3];
+    float at[4];   // x, y, z, heading
     NearestSavePoint(ped, at);
     const bool ok = WriteSave(g_cfg.autoSaveSlot, kAutoName, "auto save", at);
     if (ok) g_timedSince = now;
@@ -602,8 +630,8 @@ void QuickSaveFrame() {
 
 static void Act() {
     if (g_cfg.autoSave) AutoSave();
-    if (!g_cfg.quickSave) return;
-    TimedQuickSave();
+    TimedQuickSave();   // [QuickSave] AutoMinutes, on its own in the Modern Fix menu
+    if (!g_cfg.quickSave) { g_pressSave = g_pressLoad = false; return; }
     const bool save = g_pressSave, load = g_pressLoad;
     g_pressSave = g_pressLoad = false;
     if (!(save || load) || !InGame()) return;
@@ -637,8 +665,9 @@ void QuickSaveAfterPresent() {
     Act();
 }
 
+// Installed even when all of it is off: the Modern Fix menu (fixmenu.cpp) turns each
+// part on and off while playing.
 void InstallQuickSave() {
-    if (!g_cfg.quickSave && !g_cfg.autoSave) { Log("QuickSave: quick save and auto save off"); return; }
     // C_PcSave::SaveSlot: movsx eax,byte [esp+4]; push ebx; push ebp; mov ebx,ecx; push eax; call
     static const unsigned char saveSlot[] = { 0x0F, 0xBE, 0x44, 0x24, 0x04, 0x53, 0x55, 0x89, 0xCB, 0x50, 0xE8 };
     // CTheScripts::IsPlayerOnAMission: cmp dword [OnAMissionFlag], 0
@@ -649,7 +678,6 @@ void InstallQuickSave() {
                     : memcmp((void*)0x44FE30, onMission, sizeof onMission) ? "mission check (0x44FE30)"
                     : !nameTarget ? "save name lookup (0x61C51A)" : nullptr;
     if (bad) {
-        g_cfg.quickSave = g_cfg.autoSave = false;
         Log("QuickSave: %s is not the v1.0 code (another exe version or mod); not installed", bad);
         return;
     }
@@ -663,10 +691,10 @@ void InstallQuickSave() {
     VirtualProtect((void*)NAME_SITE, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), (void*)NAME_SITE, 5);
     g_installed = true;
-    if (g_cfg.quickSave)
-        Log("QuickSave: installed, save key %d, load key %d (virtual-key codes), slot %d, named \"Quick Save\"",
-            g_cfg.quickSaveKey, g_cfg.quickLoadKey, g_cfg.quickSaveSlot);
-    if (g_cfg.quickSave && g_cfg.quickSaveEvery > 0)
+    Log("QuickSave: installed, save key %d, load key %d (virtual-key codes), slot %d, named \"Quick Save\" (%s)",
+        g_cfg.quickSaveKey, g_cfg.quickLoadKey, g_cfg.quickSaveSlot, g_cfg.quickSave ? "on" : "off");
+    if (g_cfg.quickSaveEvery > 0)
         Log("QuickSave: timed quick save every %d minutes of play, when safe", g_cfg.quickSaveEvery);
-    if (g_cfg.autoSave) Log("AutoSave: on, after missions and jobs, slot %d, named \"Auto Save\"", g_cfg.autoSaveSlot);
+    Log("AutoSave: after missions and jobs, slot %d, named \"Auto Save\" (%s)", g_cfg.autoSaveSlot,
+        g_cfg.autoSave ? "on" : "off");
 }
