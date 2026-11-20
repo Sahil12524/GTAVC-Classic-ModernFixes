@@ -25,6 +25,7 @@
 #include "missionhelp.h"
 #include "population.h"
 #include "pizza.h"
+#include "oddjobs.h"
 #include <windows.h>
 #include <string.h>
 
@@ -91,6 +92,8 @@ static bool __fastcall HookProcessOne(unsigned char* script, void*) {
     if (ScriptCharGuard(script)) return false;
     // Pizza Boy's throw keys answered for the mouse (pizza.cpp)
     if (PizzaScriptCommand(script)) return false;
+    // Fire truck / ambulance / vigilante targets on the mainland before the bridges open (oddjobs.cpp)
+    if (OddJobScriptCommand(script)) return false;
     if (g_cfg.stuntJumpNormal && IsUsj(script)) {
         DWORD& ip = *(DWORD*)(script + SCRIPT_IP);
         if (const int len = SkipLength(ip)) {

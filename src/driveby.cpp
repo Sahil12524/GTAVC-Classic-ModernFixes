@@ -127,6 +127,49 @@ static void SetWeapon(unsigned char* ped, int slot) {
     ((void (__thiscall*)(void*, int))FN_SET_WEAPON)(ped, *(int*)(ped + PED_WEAPONS + slot * 0x18));
 }
 
+// ---------------------------------------------------------------- reload
+// An empty clip in drive-by mode. FireFromCar (0x5D44E0) fires only with the weapon
+// READY (0) or FIRING (1) and a round in the clip (CWeapon +4 state, +8 clip, +0x0C
+// total, +0x10 timer); the shot that empties it sets RELOADING (2). The game refills
+// the clip only in DoDriveByShootings' "no side" branch (0x5C99F0: clip = total, at
+// most the clip size, CWeaponInfo +0x10), when the arm goes back in. In drive-by mode
+// the arm stays out, so after one clip the crosshair stayed and nothing fired until
+// Alt was pressed twice. Now, with the gun out and the clip empty, it is refilled
+// after the weapon's reload time (CWeaponInfo +0x0C) and made READY. A weapon timer
+// left far ahead (a save loaded with an earlier clock) is brought back too.
+static int g_reloadType = -1;
+static DWORD g_reloadEnd = 0;
+static unsigned g_reloadLogs = 0;
+
+static void KeepLoaded(unsigned char* ped) {
+    unsigned char* w = CurWeapon(ped);
+    const int type = *(const int*)w;
+    int& state = *(int*)(w + 4);
+    int& clip = *(int*)(w + 8);
+    const int total = *(const int*)(w + 0x0C);
+    DWORD& timer = *(DWORD*)(w + 0x10);
+    const DWORD now = *(DWORD*)CLOCK;
+    if ((int)(timer - now) > 5000) timer = now;
+    if ((int)(g_nextShot - now) > 5000) g_nextShot = now;
+    if (clip > 0 && state != 2) { g_reloadType = -1; return; }
+    if (total <= 0) { g_reloadType = -1; return; }   // out of ammo: the game's own
+    const unsigned char* info = ((unsigned char* (__cdecl*)(int))FN_INFO)(type);
+    if (!info) return;
+    if (g_reloadType != type) {   // the reload starts now
+        int t = *(const int*)(info + 0x0C);
+        t = t < 0 ? 0 : t > 5000 ? 5000 : t;
+        g_reloadType = type;
+        g_reloadEnd = now + (DWORD)t;
+        return;
+    }
+    if ((int)(now - g_reloadEnd) < 0) return;
+    const int size = *(const int*)(info + 0x10);
+    clip = size > 0 && total > size ? size : total;
+    state = 0;
+    g_reloadType = -1;
+    if (g_reloadLogs++ < 5) Log("DriveBy: reloaded with the gun out (weapon %d, %d rounds in the clip)", type, clip);
+}
+
 // ---------------------------------------------------------------- side
 // Replaces step 2 of the three DoDriveByShootings: al = left, ah = right.
 extern "C" unsigned __cdecl vcmf_db_side(int bike, unsigned char* veh) {
@@ -143,6 +186,7 @@ extern "C" unsigned __cdecl vcmf_db_side(int bike, unsigned char* veh) {
     }
     if (!Active(veh)) return left | (right << 8);
     g_lastRun = *(DWORD*)CLOCK;   // the gun is out right now
+    if (unsigned char* ped = FindPlayerPed()) KeepLoaded(ped);
     if (left || right) return left | (right << 8);   // Q / E: the game's look, the shot follows the camera
     const float* r = (const float*)(veh + 0x04);
     const float* f = (const float*)(veh + 0x14);

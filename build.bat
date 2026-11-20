@@ -4,7 +4,7 @@ rem Requires Zig (winget install zig.zig).
 cd /d "%~dp0"
 zig c++ -target x86-windows-gnu -std=c++17 -O2 -s -shared -fno-exceptions -fno-rtti -Wno-dll-attribute-on-redeclaration ^
   -o d3d8.dll ^
-  src\dllmain.cpp src\config.cpp src\framelimiter.cpp src\fixedtick.cpp src\interp.cpp src\watchdog.cpp src\mousefix.cpp src\preload.cpp src\freecam.cpp src\quicksave.cpp src\phoneskip.cpp src\interior.cpp src\drawdist.cpp src\gameplay.cpp src\exitguard.cpp src\population.cpp src\stuntjump.cpp src\missionhelp.cpp src\aircontrol.cpp src\hunter.cpp src\faststream.cpp src\driveby.cpp src\mouselook.cpp src\alphafix.cpp src\fixmenu.cpp src\modernkeys.cpp src\onfootcam.cpp src\updateprofile.cpp src\timing.cpp src\widescreen.cpp src\viewscan.cpp src\farlights.cpp src\clouds.cpp src\pizza.cpp ^
+  src\dllmain.cpp src\config.cpp src\framelimiter.cpp src\fixedtick.cpp src\interp.cpp src\watchdog.cpp src\mousefix.cpp src\preload.cpp src\freecam.cpp src\quicksave.cpp src\phoneskip.cpp src\interior.cpp src\drawdist.cpp src\gameplay.cpp src\exitguard.cpp src\population.cpp src\stuntjump.cpp src\missionhelp.cpp src\aircontrol.cpp src\hunter.cpp src\faststream.cpp src\driveby.cpp src\mouselook.cpp src\alphafix.cpp src\fixmenu.cpp src\modernkeys.cpp src\onfootcam.cpp src\updateprofile.cpp src\timing.cpp src\widescreen.cpp src\viewscan.cpp src\farlights.cpp src\clouds.cpp src\pizza.cpp src\oddjobs.cpp ^
   -luser32 -lkernel32
 if errorlevel 1 exit /b 1
 del /q d3d8.pdb d3d8.lib dllmain.lib 2>nul

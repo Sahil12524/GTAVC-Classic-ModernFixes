@@ -209,6 +209,94 @@ static void MarkersEndRedraw() {
         if (g_markerLive[i])
             memcpy((unsigned char*)MARKERS + i * MARKER_SIZE, g_markerSave + i * MARKER_SIZE, MARKER_SIZE);
 }
+// The fire truck's water jet (CWaterCannons::aCannons, 3 x 0x19C bytes at 0x97F34C:
+// id +0, newest point +4 (short), 16 points at +0x0C, their speeds at +0xCC, in use
+// at +0x18C). Each tick the truck adds a point at the nozzle (0x57B160) and
+// CWaterCannon::Update_OncePerFrame (0x57BB90, through the call at 0x4A45B9) moves
+// every point by its speed x the time step; CWaterCannons::Render (call at 0x4A6515)
+// draws the jet through the points every frame. Redraw frames drew the last tick's
+// points: the jet moved 30 times a second. At the end of each tick the points are
+// kept; a point that is the same drop as the tick before (it moved by its speed x
+// the step) is drawn between its two places, at the same blend as the objects, and
+// the newest one (at the nozzle) between the last two nozzle points, so the jet's
+// start follows the blended truck. The live points are put back after the redraw.
+static const DWORD CANNONS = 0x97F34C, CANNON_SIZE = 0x19C, NUM_CANNONS = 3, CANNON_POINTS = 16;
+static const DWORD CANNON_POS = 0x0C, CANNON_VEL = 0xCC, CANNON_USED = 0x18C;
+static bool g_cannonsOk = false;   // the game's own water cannon code
+struct CannonShot {
+    DWORD id;
+    float pos[CANNON_POINTS][3];
+    bool used[CANNON_POINTS], same[CANNON_POINTS];   // same: the drop it was last tick, moved
+    bool hasNew;
+    float newest[3];                                  // the point added at the nozzle this tick
+};
+static CannonShot g_cannonPrev[NUM_CANNONS], g_cannonCur[NUM_CANNONS];
+static bool g_cannonHistory = false;
+static unsigned char g_cannonSave[NUM_CANNONS * CANNON_SIZE];
+
+static void CannonsEndOfTick() {
+    if (!g_cannonsOk) return;
+    memcpy(g_cannonPrev, g_cannonCur, sizeof g_cannonCur);
+    const float ts = *TimeStep;
+    const unsigned char* c = (const unsigned char*)CANNONS;
+    for (DWORD k = 0; k < NUM_CANNONS; k++, c += CANNON_SIZE) {
+        CannonShot& s = g_cannonCur[k];
+        const CannonShot& p = g_cannonPrev[k];
+        s.id = *(const DWORD*)c;
+        s.hasNew = false;
+        const bool sameJet = g_cannonHistory && s.id && p.id == s.id;
+        for (DWORD i = 0; i < CANNON_POINTS; i++) {
+            const float* q = (const float*)(c + CANNON_POS) + i * 3;
+            const float* v = (const float*)(c + CANNON_VEL) + i * 3;
+            s.used[i] = s.id && c[CANNON_USED + i];
+            memcpy(s.pos[i], q, sizeof s.pos[i]);
+            s.same[i] = false;
+            if (!s.used[i]) continue;
+            if (sameJet && p.used[i]) {
+                float err = 0.0f;
+                for (int a = 0; a < 3; a++) {
+                    const float d = q[a] - p.pos[i][a] - v[a] * ts;
+                    err += d * d;
+                }
+                s.same[i] = err < 1.0f;   // moved by its speed: the same drop
+            }
+            if (!s.same[i] && !s.hasNew) { s.hasNew = true; memcpy(s.newest, q, sizeof s.newest); }
+        }
+    }
+    g_cannonHistory = true;
+}
+
+static void CannonsForget() { g_cannonHistory = false; memset(g_cannonCur, 0, sizeof g_cannonCur); }
+
+static void CannonsBeginRedraw(float a) {
+    if (!g_cannonsOk) return;
+    memcpy(g_cannonSave, (const void*)CANNONS, sizeof g_cannonSave);
+    if (!g_cannonHistory) return;
+    a = a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a;
+    unsigned char* c = (unsigned char*)CANNONS;
+    for (DWORD k = 0; k < NUM_CANNONS; k++, c += CANNON_SIZE) {
+        const CannonShot& p = g_cannonPrev[k];
+        const CannonShot& s = g_cannonCur[k];
+        if (!s.id || *(const DWORD*)c != s.id || p.id != s.id) continue;
+        for (DWORD i = 0; i < CANNON_POINTS; i++) {
+            if (!s.used[i] || !c[CANNON_USED + i]) continue;
+            float* q = (float*)(c + CANNON_POS) + i * 3;
+            const float* from;
+            if (s.same[i]) from = p.pos[i];
+            else if (p.hasNew && s.hasNew && !memcmp(s.pos[i], s.newest, sizeof s.newest)) from = p.newest;
+            else continue;
+            float d2 = 0.0f;
+            for (int ax = 0; ax < 3; ax++) d2 += (s.pos[i][ax] - from[ax]) * (s.pos[i][ax] - from[ax]);
+            if (d2 > 400.0f) continue;   // more than 20 m: not a blend
+            for (int ax = 0; ax < 3; ax++) q[ax] = from[ax] + (s.pos[i][ax] - from[ax]) * a;
+        }
+    }
+}
+
+static void CannonsEndRedraw() {
+    if (g_cannonsOk) memcpy((void*)CANNONS, g_cannonSave, sizeof g_cannonSave);
+}
+
 static bool g_snapValid = false;                  // last tick rendered the 3D scene
 static LARGE_INTEGER g_freq;
 static LONGLONG g_period = 0, g_nextTick = 0;
@@ -542,7 +630,9 @@ static void Redraw(void* arg) {
     InterpApply(BlendAlpha(g_frameTime), false);
     TimingEnd(TS_INTERP_APPLY, t0);
     MarkersBeginRedraw(BlendAlpha(g_frameTime));
+    CannonsBeginRedraw(BlendAlpha(g_frameTime));
     g_redrawEntry(arg);            // Idle()'s render half; returns through Idle()'s epilogue
+    CannonsEndRedraw();
     MarkersEndRedraw();
     t0 = TimingStart();
     InterpRestore(false);
@@ -680,8 +770,8 @@ static void __cdecl HookIdle(void* arg) {
     }
     unsigned long long t0 = TimingStart();
     SnapshotPools();   // what the lists this tick built were made from
-    if (g_interpTick && ReplayPlaying() == replay) MarkersEndOfTick();   // 3D markers' place, spin, size
-    else MarkersForget();
+    if (g_interpTick && ReplayPlaying() == replay) { MarkersEndOfTick(); CannonsEndOfTick(); }   // 3D markers, water jet
+    else { MarkersForget(); CannonsForget(); }
     TimingEnd(TS_TICK_SNAPSHOTS, t0);
     if (g_interpOn) {
         t0 = TimingStart();
@@ -693,6 +783,7 @@ static void __cdecl HookIdle(void* arg) {
     if (ReplayPlaying() != replay) {   // a replay started or ended inside this update
         InterpReset();
         MarkersForget();
+        CannonsForget();
         g_crlValid = false;   // its lists are from the other world: the next tick builds new ones
     }
     if (replay || ReplayPlaying()) return;   // the mod helpers stay paused during a replay
@@ -824,6 +915,14 @@ bool InstallFixedTick() {
     g_markersOk = Matches(0x570BA0, markerRender, sizeof markerRender) && Matches(0x570BB4, markerLoop, sizeof markerLoop)
                && Matches(0x570BC0, markerFlag, sizeof markerFlag) && Matches(0x570C51, markerModel, sizeof markerModel);
     if (!g_markersOk) Log("FixedTick: 3D marker code changed by another mod; markers left to it");
+    // CWaterCannon::Update_OncePerFrame: push ebx; mov ebx,ecx; mov eax,[ebx+8]; push ebp;
+    // add eax,96h; and the points loop's "cmp byte [ebx+eax+18Ch],0"
+    static const unsigned char cannonUpdate[] = { 0x53, 0x89, 0xCB, 0x8B, 0x43, 0x08, 0x55, 0x05, 0x96, 0x00, 0x00, 0x00 };
+    static const unsigned char cannonUsed[] = { 0x80, 0xBC, 0x03, 0x8C, 0x01, 0x00, 0x00, 0x00 };
+    static const unsigned char cannonArray[] = { 0xBE, 0x4C, 0xF3, 0x97, 0x00 };
+    g_cannonsOk = Matches(0x57BB90, cannonUpdate, sizeof cannonUpdate) && Matches(0x57BBD3, cannonUsed, sizeof cannonUsed)
+               && Matches(0x57B127, cannonArray, sizeof cannonArray);
+    if (!g_cannonsOk) Log("FixedTick: water cannon code changed by another mod; the fire truck's jet left to it");
 
     g_code = (unsigned char*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_code) { Log("FixedTick: VirtualAlloc failed"); return false; }
