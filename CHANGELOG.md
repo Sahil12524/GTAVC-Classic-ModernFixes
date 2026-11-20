@@ -4,6 +4,28 @@ All notable changes to VC Modern Fix (GTAVC Classic ModernFixes). Every feature
 can be switched off in `VCModernFix.ini`; most also in the game's
 **Options > Modern Fix** menu. Settings named below are `[Section] Key`.
 
+## Unreleased
+
+### Fixed
+
+- **Free drive-by stopped shooting** (`[Weapons] FreeDriveBy`): after one clip
+  the crosshair stayed but nothing fired until Alt was pressed twice. The game
+  refills a drive-by clip only when the arm goes back inside the vehicle, and in
+  Alt mode it stays out. The clip now reloads with the gun out, after the gun's
+  own reload time. A shot timer left far ahead by loading a save no longer
+  blocks firing.
+- **Fire truck, ambulance and vigilante jobs had no targets on the mainland
+  before the bridges open**: the job scripts only looked for burning cars,
+  patients and criminals on the beach islands until "Phnom Penh '86", so started
+  on the mainland (reached with a trainer, a mod or a save) they found nothing
+  150–600 m away: no target, no blip. On the mainland they now pick targets
+  around the player, as after the bridges open. On the beach islands, and in
+  every other script, the game's own check stands.
+- **Fire truck water jet at 30 fps**: the jet's points move once per game tick;
+  they are now drawn between their last two places on every frame, and the jet's
+  start follows the blended truck. The game's own water data (putting out fires,
+  pushing people) is unchanged.
+
 ## 2026-11-20
 
 Everything since the first public commit (2026-11-13).

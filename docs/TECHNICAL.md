@@ -1647,6 +1647,7 @@ Requires [Zig](https://ziglang.org/) (`winget install zig.zig`). Run
 | `src/timing.cpp` | times VCModernFix's own work per update and per frame; the `Timing:` line and its before / after checks |
 | `src/preload.cpp` | reads `SFX.RAW`, `gta3.img` and the audio streams into memory at start; the `Memory:` line |
 | `src/modernkeys.cpp` | modern key layout (Q radio, E horn, Shift sprint, WASD, turret keys); Delete off aim / zoom; bikes lean with Num8 / Num5 only (the call at 0x60A69D) |
+| `src/oddjobs.cpp` | Fire truck / ambulance / vigilante jobs: their `0038 $236 0` island checks answered "open" while the player is on the mainland before the bridges open, so targets are picked around the player |
 | `src/pizza.cpp` | Pizza Boy: right + left mouse button throws; every throw aimed at the nearest waiting customer ($7966..$7975 with $7996..$8005 set), the script's IS_BUTTON_PRESSED 5 / 7 / 17 answered and $8040 / $8041 set before SET_OBJECT_VELOCITY |
 | `src/widescreen.cpp` | widescreen picture and 4:3 HUD; near clip brought in for a wider FOV |
 | `src/viewscan.cpp` | the world scan covers the whole view at any camera angle |
