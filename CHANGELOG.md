@@ -4,7 +4,7 @@ All notable changes to VC Modern Fix (GTAVC Classic ModernFixes). Every feature
 can be switched off in `VCModernFix.ini`; most also in the game's
 **Options > Modern Fix** menu. Settings named below are `[Section] Key`.
 
-## Unreleased
+## v1.1.1 (2026-11-20)
 
 ### Fixed
 
